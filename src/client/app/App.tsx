@@ -30,6 +30,17 @@ import { TerminalPage } from "./TerminalPage"
 import { useKannaState } from "./useKannaState"
 import { useMigrateChannelPins } from "./useMigrateChannelPins"
 import { useSidebarStore } from "../stores/sidebarStore"
+import { probeNeoClaw, useNeoClawStore } from "../stores/neoClawStore"
+import { useNc, type Tree } from "../neoclaw/api"
+import { NeoRail, NeoSidebar } from "../neoclaw/NavTree"
+import { BottomTabs } from "../neoclaw/Shell"
+import { HomePage as NeoHomePage } from "../neoclaw/pages/HomePage"
+import { ChannelsPage, SpacesPage } from "../neoclaw/pages/BrowsePages"
+import { SpacePage } from "../neoclaw/pages/SpacePage"
+import { ChannelPage } from "../neoclaw/pages/ChannelPage"
+import { RunPage } from "../neoclaw/pages/RunPage"
+import { LibraryPage, SkillPage } from "../neoclaw/pages/LibraryPage"
+import { InfraPage } from "../neoclaw/pages/InfraPage"
 import type { AppSettingsSnapshot } from "../../shared/types"
 
 const AUTH_STATUS_RETRY_DELAY_MS = 500
@@ -375,6 +386,24 @@ function KannaLayout() {
     />
   )
 
+  const neoUser = useNeoClawStore((s) => s.user)
+  const neoTree = useNc<Tree>(neoUser ? "/tree" : null, { pollMs: 15_000 }).data
+  const onChat = location.pathname.startsWith("/chat/")
+  const neoSidebar = neoUser ? (
+    state.sidebarCollapsed ? (onChat ? null : <NeoRail onExpand={state.expandSidebar} />) : <NeoSidebar tree={neoTree} onCollapse={state.collapseSidebar} />
+  ) : null
+  // A chat's Back button (phones) goes to its channel when there's no history to pop.
+  const openNeoChannel = useCallback(() => {
+    if (((window.history.state as { idx?: number } | null)?.idx ?? 0) > 0) return navigate(-1)
+    const chatId = state.activeChatId
+    if (!chatId) return navigate("/home")
+    void fetch(`/api/nc/chat-channel?chatId=${encodeURIComponent(chatId)}`, { credentials: "same-origin" })
+      .then((r) => (r.ok ? (r.json() as Promise<{ channelId: string | null }>) : null))
+      .then((r) => navigate(r?.channelId ? `/c/${r.channelId}` : "/home"))
+      .catch(() => navigate("/home"))
+  }, [navigate, state.activeChatId])
+  const outletState = useMemo(() => (neoUser ? { ...state, openSidebar: openNeoChannel } : state), [neoUser, state, openNeoChannel])
+
   useLayoutEffect(() => {
     document.title = browserTitle
   }, [browserTitle, location.key])
@@ -473,8 +502,9 @@ function KannaLayout() {
   return (
     <ChatMenuCommandsProvider value={chatMenuCommands}>
     <div className="flex h-[100dvh] min-h-[100dvh] overflow-hidden">
-      {sidebarElement}
-      <Outlet context={state} />
+      {neoUser ? neoSidebar : sidebarElement}
+      <Outlet context={outletState} />
+      {neoUser ? <BottomTabs /> : null}
       <SetupWizard />
       <CommandPalette state={state} />
       <StandaloneShareDialog
@@ -493,8 +523,23 @@ function KannaLayout() {
   )
 }
 
+/** neo-claw pages wait for the /api/neoclaw/me probe, then show `neo` or the stock Kanna page. */
+function NeoOr({ neo, children }: { neo: React.ReactNode; children: React.ReactNode }) {
+  const user = useNeoClawStore((s) => s.user)
+  const probed = useNeoClawStore((s) => s.probed)
+  if (!probed) return <div className="flex-1 bg-background" />
+  return <>{user ? neo : children}</>
+}
+
+function NeoOnly({ children }: { children: React.ReactNode }) {
+  return <NeoOr neo={children}><Navigate to="/" replace /></NeoOr>
+}
+
 export function App() {
   const auth = useAppAuthState()
+  useEffect(() => {
+    if (auth.state.status === "ready") probeNeoClaw()
+  }, [auth.state.status])
 
   if (auth.state.status === "checking") {
     return (
@@ -518,8 +563,17 @@ export function App() {
             {/* On mobile the sidebar fills the screen at `/` (see
                 KannaSidebar), so the projects page hides there and lives at
                 `/home` instead. Desktop shows it at both paths. */}
-            <Route path="/" element={<div className="hidden md:contents"><LocalProjectsPage /></div>} />
-            <Route path="/home" element={<LocalProjectsPage />} />
+            <Route path="/" element={<NeoOr neo={<Navigate to="/home" replace />}><div className="hidden md:contents"><LocalProjectsPage /></div></NeoOr>} />
+            <Route path="/home" element={<NeoOr neo={<NeoHomePage />}><LocalProjectsPage /></NeoOr>} />
+            <Route path="/projects" element={<LocalProjectsPage />} />
+            <Route path="/spaces" element={<NeoOnly><SpacesPage /></NeoOnly>} />
+            <Route path="/spaces/:spaceId" element={<NeoOnly><SpacePage /></NeoOnly>} />
+            <Route path="/channels" element={<NeoOnly><ChannelsPage /></NeoOnly>} />
+            <Route path="/c/:channelId" element={<NeoOnly><ChannelPage /></NeoOnly>} />
+            <Route path="/c/:channelId/runs/:runId" element={<NeoOnly><RunPage /></NeoOnly>} />
+            <Route path="/library" element={<NeoOnly><LibraryPage /></NeoOnly>} />
+            <Route path="/library/skill" element={<NeoOnly><SkillPage /></NeoOnly>} />
+            <Route path="/infra" element={<NeoOnly><InfraPage /></NeoOnly>} />
             <Route path="/settings" element={<Navigate to="/settings/general" replace />} />
             <Route path="/settings/:sectionId" element={<Suspense fallback={null}><SettingsPage /></Suspense>} />
             <Route path="/chat/:chatId" element={<ChatPage />} />

@@ -22,7 +22,6 @@ export function NeoClawMirrorToggle() {
         Mirror to Discord
       </label>
       <span className="opacity-70">as {user.displayName}</span>
-      <a className="underline opacity-70 hover:opacity-100" href="/neoclaw" target="_blank" rel="noopener">overview</a>
     </div>
   )
 }

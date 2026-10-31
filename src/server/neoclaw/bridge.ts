@@ -918,7 +918,8 @@ export class NeoClawBridge {
   // (`.neo-claw/runs/<stamp>-<session8>.jsonl`). Those carry no prompt, so
   // the prompt comes from the channel's Discord archive (or the web send).
 
-  private webPrompts = new Map<string, { at: number; text: string; user: SessionUser }[]>()
+  private webPrompts = new Map<string, { at: number; text: string; user: SessionUser; threadId?: string | null }[]>()
+  private triggerCache = new Map<string, { size: number; triggers: { at: number; text: string; authorId: string; authorName: string; threadId: string | null }[] }>()
 
   private traceStart(file: string) {
     const m = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z/.exec(path.basename(file))
@@ -929,18 +930,21 @@ export class NeoClawBridge {
     const file = path.join(this.channelDir(channelId), "discord", "messages.jsonl")
     const st = await safeStat(file)
     if (!st) return []
+    const hit = this.triggerCache.get(channelId)
+    if (hit && hit.size === st.size) return hit.triggers
     const { text } = await readRange(file, Math.max(0, st.size - 2 * 1024 * 1024), st.size, st.size > 2 * 1024 * 1024)
-    const out: { at: number; text: string; authorId: string; authorName: string }[] = []
+    const out: { at: number; text: string; authorId: string; authorName: string; threadId: string | null }[] = []
     for (const line of text.split("\n")) {
       if (!line.includes('"triggerType":"') || !line.includes('"message_create"')) continue
       try {
-        const ev = JSON.parse(line) as { createdAt: string; cleanContent?: string; content?: string; authorId: string; authorName: string; authorGlobalName?: string; triggerType?: string | null }
+        const ev = JSON.parse(line) as { createdAt: string; channelId?: string; cleanContent?: string; content?: string; authorId: string; authorName: string; authorGlobalName?: string; triggerType?: string | null }
         if (!ev.triggerType) continue
-        out.push({ at: Date.parse(ev.createdAt), text: (ev.cleanContent ?? ev.content ?? "").replace(/^@neo-claw\s*/, ""), authorId: ev.authorId, authorName: ev.authorGlobalName || ev.authorName })
+        out.push({ at: Date.parse(ev.createdAt), text: (ev.cleanContent ?? ev.content ?? "").replace(/^@neo-claw\s*/, ""), authorId: ev.authorId, authorName: ev.authorGlobalName || ev.authorName, threadId: ev.channelId && ev.channelId !== channelId ? ev.channelId : null })
       } catch {
         // skip
       }
     }
+    this.triggerCache.set(channelId, { size: st.size, triggers: out })
     return out
   }
 
@@ -1023,7 +1027,7 @@ export class NeoClawBridge {
     return null
   }
 
-  async sendTurn(args: { channelId: string; text: string; user: SessionUser; mirror: boolean; steer: boolean }): Promise<{ chatId: string | null; steered: boolean }> {
+  async sendTurn(args: { channelId: string; text: string; user: SessionUser; mirror: boolean; steer: boolean; threadId?: string }): Promise<{ chatId: string | null; steered: boolean }> {
     const text = args.text.trim()
     if (!text) throw new Error("Empty message")
     if (!this.config.apiUrl || !this.config.apiSecret) throw new Error("neo-claw web API is not configured on this server")
@@ -1033,7 +1037,7 @@ export class NeoClawBridge {
     try {
       res = await this.api("/api/turn", {
         method: "POST",
-        body: JSON.stringify({ channelId: args.channelId, text, discordUserId: args.user.discordId, displayName: args.user.displayName, mirror: args.mirror, steer: args.steer }),
+        body: JSON.stringify({ channelId: args.channelId, threadId: args.threadId, text, discordUserId: args.user.discordId, displayName: args.user.displayName, mirror: args.mirror, steer: args.steer }),
       })
     } catch {
       this.webTurns.delete(args.channelId)
@@ -1048,7 +1052,7 @@ export class NeoClawBridge {
     }
     const remote = this.remoteHostFor(args.channelId)
     const sent = (this.webPrompts.get(args.channelId) ?? this.webPrompts.set(args.channelId, []).get(args.channelId)!)
-    sent.push({ at: Date.now(), text, user: args.user })
+    sent.push({ at: Date.now(), text, user: args.user, threadId: args.threadId ?? null })
     if (sent.length > 20) sent.splice(0, sent.length - 20)
     const chatId = this.currentChatFor(args.channelId)
     if ((res.headers.get("content-type") ?? "").includes("application/json")) {
@@ -1144,6 +1148,96 @@ export class NeoClawBridge {
     if (!res) throw new Error("neo-claw's web API isn't reachable")
     if (res.status === 409) throw new Error("Nothing is running in this channel")
     if (!res.ok) throw new Error(`neo-claw refused to stop (${res.status})`)
+  }
+
+  // ---------------------------------------------------------------- app API helpers
+
+  /** The Kanna chat a new message to this channel lands in (its current session). */
+  currentChat(channelId: string) {
+    return this.currentChatFor(channelId)
+  }
+
+  /** Run state for a channel, merged with web turns in flight. */
+  channelState(channelId: string) {
+    const s = this.statuses.get(channelId)
+    const web = this.webTurns.get(channelId)
+    return {
+      running: Boolean(s?.running) || web === "running",
+      queued: (s?.queued ?? 0) + (web === "queued" || web === "sending" ? 1 : 0),
+      sessionId: s?.sessionId ?? this.sessionsMap[channelId] ?? null,
+    }
+  }
+
+  liveContextTokens(channelId: string) {
+    return this.contextTokens.get(channelId) ?? null
+  }
+
+  /** Kanna chats mirrored for a channel: one per Claude session (newest first). */
+  sessionChats(channelId: string) {
+    const current = this.currentChatFor(channelId)
+    const out: { chatId: string; sessionId: string | null; kind: "session" | "remote"; title: string; lastMessageAt: number | null; current: boolean }[] = []
+    for (const link of Object.values(this.state.chats)) {
+      if (link.channelId !== channelId) continue
+      const chat = this.store.getChat(link.chatId)
+      if (!chat) continue
+      out.push({
+        chatId: link.chatId,
+        sessionId: link.sessionId ?? null,
+        kind: link.kind,
+        title: chat.title ?? "Session",
+        lastMessageAt: link.lastMessageAt ?? chat.lastMessageAt ?? null,
+        current: link.chatId === current,
+      })
+    }
+    out.sort((a, b) => Number(b.current) - Number(a.current) || (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0))
+    return out
+  }
+
+  /** Channel a Kanna chat belongs to. */
+  channelForChat(chatId: string) {
+    return this.linkFor(chatId)?.channelId ?? null
+  }
+
+  /** Who started each run: a web prompt from here, or the Discord message that triggered it. */
+  async runTriggers(channelId: string, runs: { id: string; startedAt: number }[]) {
+    const out = new Map<string, { author: string; authorId: string | null; text: string; via: "web" | "discord"; threadId: string | null }>()
+    if (runs.length === 0) return out
+    const sorted = [...runs].sort((a, b) => a.startedAt - b.startedAt)
+    const archive = await this.archiveTriggers(channelId)
+    const web = this.webPrompts.get(channelId) ?? []
+    let prev = 0
+    for (const r of sorted) {
+      const floor = Math.max(prev, r.startedAt - 6 * 3600_000)
+      const w = web.filter((p) => p.at <= r.startedAt + 5000 && p.at > floor).pop()
+      const a = archive.filter((t) => t.at <= r.startedAt + 2000 && t.at > floor).pop()
+      if (w && (!a || w.at >= a.at)) out.set(r.id, { author: w.user.displayName, authorId: w.user.discordId, text: w.text, via: "web", threadId: w.threadId ?? null })
+      else if (a) out.set(r.id, { author: this.authorNames.get(a.authorId) ?? a.authorName, authorId: a.authorId, text: a.text, via: "discord", threadId: a.threadId })
+      prev = r.startedAt
+    }
+    return out
+  }
+
+  /** POST to the neo-claw API, returning its JSON or throwing its error message. */
+  async apiPost(pathname: string, body: Record<string, unknown>, timeoutMs = 30_000) {
+    let res: Response
+    try {
+      res = await this.api(pathname, { method: "POST", body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) })
+    } catch {
+      throw new Error("neo-claw's web API isn't reachable right now (it comes up with the next bot deploy).")
+    }
+    const json = (await res.json().catch(() => ({}))) as Record<string, unknown>
+    if (!res.ok) {
+      const err = new Error(String(json.error ?? `neo-claw refused (${res.status})`)) as Error & { status?: number; detail?: unknown }
+      err.status = res.status
+      err.detail = json
+      throw err
+    }
+    return json
+  }
+
+  /** Something was created on Discord: re-read names and spaces soon. */
+  async afterDiscordChange() {
+    await this.refreshSpacesSoon()
   }
 
   // ---------------------------------------------------------------- overview panel

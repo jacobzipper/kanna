@@ -14,6 +14,8 @@ export interface NeoClawUser {
 
 interface NeoClawState {
   user: NeoClawUser | null
+  /** The /api/neoclaw/me probe has answered (either way). */
+  probed: boolean
   mirror: boolean
   setMirror: (mirror: boolean) => void
 }
@@ -27,6 +29,7 @@ function readMirror() {
 
 export const useNeoClawStore = create<NeoClawState>()((set) => ({
   user: null,
+  probed: false,
   mirror: readMirror(),
   setMirror: (mirror) => {
     if (typeof window !== "undefined") window.localStorage.setItem(MIRROR_KEY, mirror ? "1" : "0")
@@ -45,6 +48,7 @@ export function probeNeoClaw() {
       if (body && typeof body.discordId === "string") useNeoClawStore.setState({ user: body })
     })
     .catch(() => undefined)
+    .finally(() => useNeoClawStore.setState({ probed: true }))
 }
 
 /** Extra fields for chat.send / message.enqueue in neo-claw mode. */

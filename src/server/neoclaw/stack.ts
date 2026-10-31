@@ -162,6 +162,11 @@ export class Stack {
     return path.join(this.config.contextDir, channelId)
   }
 
+  /** Channel ids that have a context folder on disk. */
+  async channelIds(): Promise<string[]> {
+    return cached("stack:channelIds", 30_000, async () => (await readdir(this.config.contextDir).catch(() => [] as string[])).filter(isSnowflake))
+  }
+
   private neoClawConfig() {
     if (!this.config.neoClawConfigPath) return Promise.resolve(null)
     return cached("ncconf", 60_000, () => readJson<Record<string, unknown>>(this.config.neoClawConfigPath!))
@@ -638,7 +643,12 @@ export class Stack {
         load,
         mem,
         disk,
-        queue: Array.isArray(queue) ? queue : [],
+        // deploy-when-idle writes naive local timestamps; parse them in this server's zone.
+        queue: (Array.isArray(queue) ? queue : []).map((q) =>
+          q && typeof q === "object" && typeof (q as { queued_at?: unknown }).queued_at === "string"
+            ? { ...(q as object), queuedAtMs: Date.parse((q as { queued_at: string }).queued_at) || null }
+            : q
+        ),
         deployLog: deployLog ? maskSecrets(deployLog) : null,
       }
     })
@@ -730,7 +740,9 @@ async function skillMeta(dir: string) {
   const r = await readText(path.join(dir, "SKILL.md"), 16 * 1024)
   const fm = r ? /^---\n([\s\S]*?)\n---/.exec(r.text)?.[1] ?? "" : ""
   const name = /^name:\s*(.+)$/m.exec(fm)?.[1]?.trim().replace(/^["']|["']$/g, "")
-  const description = /^description:\s*(.+)$/m.exec(fm)?.[1]?.trim().replace(/^["']|["']$/g, "") ?? ""
+  const raw = /^description:\s*(.+)$/m.exec(fm)?.[1]?.trim() ?? ""
+  // Unquote YAML scalars: "…" keeps \" escapes, '…' doubles single quotes.
+  const description = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1).replace(/\\(["\\])/g, "$1") : raw.startsWith("'") && raw.endsWith("'") ? raw.slice(1, -1).replace(/''/g, "'") : raw
   return { name, description, hasSkillMd: Boolean(r) }
 }
 

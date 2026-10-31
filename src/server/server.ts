@@ -18,6 +18,8 @@ import { createNeoClawAuthManager } from "./neoclaw/auth"
 import { NeoClawBridge } from "./neoclaw/bridge"
 import { handleConsole } from "./neoclaw/pages"
 import { Stack } from "./neoclaw/stack"
+import { handleAppApi } from "./neoclaw/api"
+import { DiscordDirectory } from "./neoclaw/discord-rest"
 import { classifyCloudRequest, isAllowedCloudWsUpgrade, type CloudRequestClass } from "./cloud/guard"
 import { createCloudRuntime, type CloudRuntime } from "./cloud"
 import { createFleetCache } from "./cloud/fleet"
@@ -388,6 +390,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
       })
     : null
   const neoClawStack = neoClawConfig && neoClawBridge ? new Stack(neoClawConfig, neoClawBridge) : null
+  const neoClawDirectory = neoClawConfig ? new DiscordDirectory(neoClawConfig.discordToken) : null
   if (neoClawBridge) {
     // Mirrored sessions are filled from neo-claw's files the first time they
     // are opened.
@@ -666,6 +669,12 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
               const user = neoClawAuth.getUser(req)
               if (!user) return new Response("Unauthorized", { status: 401 })
               const res = await handleConsole(req, url, { stack: neoClawStack, bridge: neoClawBridge, user, validateOrigin: (r) => neoClawAuth.validateOrigin(r) })
+              if (res) return res
+            }
+            if (url.pathname.startsWith("/api/nc/") && neoClawBridge && neoClawStack && neoClawDirectory) {
+              const user = neoClawAuth.getUser(req)
+              if (!user) return Response.json({ error: "Unauthorized" }, { status: 401 })
+              const res = await handleAppApi(req, url, { stack: neoClawStack, bridge: neoClawBridge, directory: neoClawDirectory, user, validateOrigin: (r) => neoClawAuth.validateOrigin(r) })
               if (res) return res
             }
             if (url.pathname === "/api/neoclaw/me") {

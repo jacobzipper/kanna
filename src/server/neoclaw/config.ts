@@ -57,11 +57,20 @@ export interface NeoClawConfig {
   nodeCli?: string
   /** systemd units whose state the ops page shows. */
   services?: string[]
+  /**
+   * A dotenv file holding the bot's Discord token (optional). Read on the
+   * server only, for read-only Discord REST lookups: category and channel
+   * names, positions and threads. Never sent to the browser.
+   */
+  discordEnvFile?: string
+  /** Key in discordEnvFile (default DISCORD_TOKEN). */
+  discordEnvKey?: string
 }
 
 export interface LoadedNeoClawConfig extends NeoClawConfig {
   apiSecret: string | null
   remoteRouting: Record<string, string>
+  discordToken: string | null
 }
 
 function expandHome(p: string) {
@@ -98,6 +107,18 @@ export function loadNeoClawConfig(env: Record<string, string | undefined> = proc
       remoteRouting = {}
     }
   }
+  let discordToken: string | null = null
+  if (raw.discordEnvFile) {
+    try {
+      const key = raw.discordEnvKey ?? "DISCORD_TOKEN"
+      for (const line of readFileSync(expandHome(raw.discordEnvFile), "utf8").split("\n")) {
+        const m = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line)
+        if (m && m[1] === key) discordToken = m[2]!.replace(/^(['"])(.*)\1$/, "$2").trim() || null
+      }
+    } catch {
+      discordToken = null
+    }
+  }
   cached = {
     ...raw,
     contextDir: expandHome(raw.contextDir),
@@ -108,6 +129,7 @@ export function loadNeoClawConfig(env: Record<string, string | undefined> = proc
     claudeSettingsPath: expandHome(raw.claudeSettingsPath ?? "~/.claude/settings.json"),
     apiSecret,
     remoteRouting,
+    discordToken,
   }
   return cached
 }
