@@ -3,7 +3,7 @@ import { Marked } from "marked"
 import path from "node:path"
 import type { NeoClawBridge, NeoClawOverview } from "./bridge"
 import type { SessionUser } from "./auth"
-import { fileTree, isSnowflake, maskSecrets, readViewable, type SkillEntry, type Stack } from "./stack"
+import { fileTree, forget, isSnowflake, maskSecrets, readViewable, type SkillEntry, type Stack } from "./stack"
 
 /**
  * The neo-claw console: plain server-rendered pages (no scripts) for spaces,
@@ -112,7 +112,8 @@ code,pre{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#d6d
 textarea{width:100%;min-height:380px;background:#0f0f12;color:#e8e8ea;border:1px solid #333;font:13px/1.45 ui-monospace,monospace;padding:8px;box-sizing:border-box}
 input[type=text],input[type=search],select{background:#0f0f12;color:#e8e8ea;border:1px solid #333;padding:5px 8px;border-radius:4px}
 button{background:#2b4a8a;color:#fff;border:0;padding:6px 12px;border-radius:4px;cursor:pointer}button.danger{background:#7a2b2b}button.quiet{background:#2a2a30}
-form.inline{display:inline}details>summary{cursor:pointer;color:#b9b9c2}
+form.inline{display:inline}details>summary{cursor:pointer;color:#b9b9c2}details.confirm{display:inline-block}details.confirm>summary{color:#ff9b9b}
+.card.ok{border-color:#2d5a3a}.card.err{border-color:#6a2b2b}
 .diff .add{color:#7bd88f}.diff .del{color:#ff7b7b}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:3px 16px;margin:0}dt{color:#9a9aa2}dd{margin:0}
 `
@@ -205,7 +206,8 @@ export async function handleConsole(req: Request, url: URL, ctx: ConsoleContext)
       case "nodes":
         return await nodesPage(ctx, url.searchParams.get("jobs"))
       case "ops":
-        return await opsPage(ctx, url.searchParams.get("usage"))
+        if (parts[1] === "action" && req.method === "POST") return await opsAction(req, ctx)
+        return await opsPage(ctx, url)
       case "search":
         return await searchPage(ctx, url)
       default:
@@ -678,9 +680,78 @@ async function nodesPage(ctx: ConsoleContext, jobsFor: string | null) {
 
 // ------------------------------------------------------------------ ops
 
-async function opsPage(ctx: ConsoleContext, usage: string | null) {
-  const o = await ctx.stack.ops()
-  const health = await ctx.bridge.apiGet<Record<string, unknown>>("/api/health", 2500)
+// Ops data and actions come from neo-claw's web API (/api/ops; ops-api.ts there). This page replaced
+// the old standalone dashboard. Without scripts (CSP), destructive buttons confirm through a <details>.
+interface OpsSnapshot {
+  bot: { unit: string; active: string; since: string; restarts: number; rss: number }
+  system: { cpus: number; load: [number, number, number]; uptimeSec: number; mem: { total: number; available: number; usedPct: number }; swap: { total: number; used: number; usedPct: number }; disk: { total: number; avail: number; usedPct: number }; swapRate: number | null }
+  sessions: { pid: number; channelId: string | null; channelName: string | null; remoteHost: string | null; ageSec: number; rss: number; children: number }[]
+  orphans: { pid: number; comm: string; args: string; ageSec: number; rss: number; channelId: string | null; channelName: string | null; channelBusy: boolean }[]
+  top: { pid: number; comm: string; rss: number; ageSec: number }[]
+  automations: {
+    cron: string[]
+    timers: { unit: string; activates: string; next: number | null; last: number | null }[]
+    wakes: { id: string; kind: string; channelId: string; note: string; due: string; jobName?: string }[]
+    deployQueue: { id: string; prs: number[]; note: string; queued_at: string }[]
+  }
+  disk: { breakdown: { at: number; items: { path: string; label: string; bytes: number }[] } | null; refreshing: boolean }
+  cleanups: { id: string; label: string; estimate: number }[]
+  restartable: string[]
+  alerts: { key: string; at: number; text: string }[]
+  pace: { host: string; label: string; pct: number; elapsedFrac: number; projectedPct: number; runsOutInMs: number | null; resetsInMs: number }[]
+  routing: { hosts: { name: string; label: string }[]; channelRouting: Record<string, string> }
+}
+
+function dur(sec: number) {
+  if (sec < 90) return `${Math.round(sec)}s`
+  if (sec < 5400) return `${Math.round(sec / 60)}m`
+  if (sec < 129600) return `${(sec / 3600).toFixed(1)}h`
+  return `${(sec / 86400).toFixed(1)}d`
+}
+
+function pctClass(pct: number, warn: number, bad: number) {
+  return pct >= bad ? "err" : pct >= warn ? "warn" : "ok"
+}
+
+/** A POST to /neoclaw/ops/action. With `confirm`, the button sits behind a <details> asking first. */
+function opsButton(action: string, target: string, label: string, confirm?: string, extra = "") {
+  const form = `<form method="post" action="/neoclaw/ops/action" class="inline"><input type="hidden" name="action" value="${esc(action)}"><input type="hidden" name="target" value="${esc(target)}">${extra}<button${confirm ? ' class="danger"' : ' class="quiet"'}>${esc(confirm ? `Yes, ${label.toLowerCase()}` : label)}</button></form>`
+  return confirm ? `<details class="confirm"><summary>${esc(label)}</summary><span class="dim">${esc(confirm)}</span> ${form}</details>` : form
+}
+
+function chan(ctx: ConsoleContext, id: string | null, name: string | null) {
+  if (!id) return `<span class="dim">?</span>`
+  return `#${esc(name ?? ctx.bridge.channelName(id))}`
+}
+
+async function opsAction(req: Request, ctx: ConsoleContext) {
+  const form = await req.formData()
+  const body = {
+    action: String(form.get("action") ?? "").slice(0, 40),
+    target: String(form.get("target") ?? "").slice(0, 120),
+    channelId: String(form.get("channelId") ?? "").slice(0, 30),
+    discordUserId: ctx.user.discordId,
+    displayName: ctx.user.displayName,
+  }
+  let ok = false
+  let message = ""
+  try {
+    const r = await ctx.bridge.apiPost("/api/ops/action", body, 60_000)
+    ok = r.ok === true
+    message = String(r.message ?? "")
+  } catch (error) {
+    const detail = (error as { detail?: { message?: unknown } }).detail
+    message = String(detail?.message ?? (error instanceof Error ? error.message : error))
+  }
+  forget("ops")
+  return redirect(`/neoclaw/ops?ok=${ok ? 1 : 0}&msg=${encodeURIComponent(maskSecrets(message).slice(0, 300))}`)
+}
+
+async function opsPage(ctx: ConsoleContext, url: URL) {
+  const usage = url.searchParams.get("usage")
+  const msg = url.searchParams.get("msg")
+  const flash = msg ? `<div class="card ${url.searchParams.get("ok") === "1" ? "ok" : "err"}">${esc(msg)}</div>` : ""
+  const [o, ops] = await Promise.all([ctx.stack.ops(), ctx.bridge.apiGet<OpsSnapshot>("/api/ops", 15_000)])
   let usageHtml = `<p><a href="/neoclaw/ops?usage=1">Load usage</a> <span class="dim">(asks neo-claw; can take a minute or two the first time, then it's cached for 10 min)</span></p>`
   if (usage) {
     const u = await ctx.bridge.apiGet<{ at: number; hosts: { host: string; ok: boolean; note?: string; limits: { label: string; pct: number; resets: string }[]; summary24h?: string }[] }>(
@@ -689,27 +760,101 @@ async function opsPage(ctx: ConsoleContext, usage: string | null) {
     )
     usageHtml = !u
       ? `<p class="warn">Usage isn't available (the neo-claw API is down or timed out).</p>`
-      : `${u.hosts.map((h) => `<div class="card"><b>${esc(h.host)}</b>${h.ok ? "" : ` <span class="warn">${esc(h.note ?? "unavailable")}</span>`}${h.limits.length ? `<table>${h.limits.map((l) => `<tr><td>${esc(l.label)}</td><td>${esc(l.pct)}%</td><td class="dim">resets ${esc(l.resets)}</td></tr>`).join("")}</table>` : ""}${h.summary24h ? `<p class="dim">${esc(h.summary24h)}</p>` : ""}</div>`).join("")}
+      : `${u.hosts.map((h) => `<div class="card"><b>${esc(h.host)}</b>${h.ok ? "" : ` <span class="warn">${esc(h.note ?? "unavailable")}</span>`}${h.limits.length ? `<table>${h.limits.map((l) => `<tr><td>${esc(l.label)}</td><td class="${pctClass(l.pct, 70, 90)}">${esc(l.pct)}%</td><td class="dim">resets ${esc(l.resets)}</td></tr>`).join("")}</table>` : ""}${h.summary24h ? `<p class="dim">${esc(h.summary24h)}</p>` : ""}</div>`).join("")}
 <p class="dim">As of ${esc(ago(u.at))}. <a href="/neoclaw/ops?usage=refresh">Refresh</a></p>`
   }
-  const mem = o.mem
-  const services = o.services.map((s) => `<tr><td>${esc(s.name)}</td><td class="${s.state === "active" ? "ok" : "err"}">${esc(s.state)}</td></tr>`).join("")
-  const queue = o.queue.length
-    ? `<table><tr><th>Id</th><th>Note</th><th>By</th><th>Queued</th></tr>${(o.queue as Record<string, unknown>[]).map((d) => `<tr><td><code>${esc(d.id)}</code></td><td>${esc(maskSecrets(String(d.note ?? "")))}</td><td>${esc(d.by ?? "")}</td><td>${esc(ago(String(d.queued_at ?? "")))}</td></tr>`).join("")}</table>`
-    : `<p class="dim">Empty.</p>`
+  const pace = ops?.pace.length
+    ? `<table><tr><th>Host</th><th>Limit</th><th>Used</th><th>Window gone</th><th>On pace for</th><th></th></tr>${ops.pace.map((p) => `<tr><td>${esc(p.host)}</td><td>${esc(p.label)}</td><td class="${pctClass(p.pct, 70, 90)}">${esc(p.pct)}%</td><td>${Math.round(100 * p.elapsedFrac)}%</td><td class="${pctClass(p.projectedPct, 90, 100)}">${Math.round(p.projectedPct)}%</td><td>${p.runsOutInMs !== null && p.runsOutInMs < p.resetsInMs ? `<b class="warn">runs out in ~${dur(p.runsOutInMs / 1000)}</b>` : ""}</td></tr>`).join("")}</table>`
+    : ""
   const links = ctx.bridge.overviewLinks()
+  const linksHtml = links.length ? `<h2>Dashboards</h2><p>${links.map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(" · ")}</p>` : ""
+  const deployLog = o.deployLog ? `<details><summary>deploy-when-idle log (tail)</summary><pre>${esc(o.deployLog)}</pre></details>` : ""
+
+  if (!ops) {
+    // neo-claw's API is down (e.g. mid-deploy): what Kanna can read itself, no actions.
+    const mem = o.mem
+    const services = o.services.map((s) => `<tr><td>${esc(s.name)}</td><td class="${s.state === "active" ? "ok" : "err"}">${esc(s.state)}</td></tr>`).join("")
+    const queue = o.queue.length
+      ? `<table><tr><th>Id</th><th>Note</th><th>By</th><th>Queued</th></tr>${(o.queue as Record<string, unknown>[]).map((d) => `<tr><td><code>${esc(d.id)}</code></td><td>${esc(maskSecrets(String(d.note ?? "")))}</td><td>${esc(d.by ?? "")}</td><td>${esc(ago(String(d.queued_at ?? "")))}</td></tr>`).join("")}</table>`
+      : `<p class="dim">Empty.</p>`
+    return page("Ops", ctx, "/neoclaw/ops", `<h1>Ops</h1>${flash}
+<p class="warn">neo-claw's API isn't reachable, so this is read-only. Actions come back when the bot is up.</p>
+<h2>Health</h2><dl><dt>Load</dt><dd>${esc(o.load)}</dd><dt>Memory</dt><dd>${bytes(mem.MemAvailable)} free of ${bytes(mem.MemTotal)}; swap ${bytes((mem.SwapTotal ?? 0) - (mem.SwapFree ?? 0))} used of ${bytes(mem.SwapTotal)}</dd>
+<dt>Disk</dt><dd>${o.disk ? `${bytes(o.disk.free)} free of ${bytes(o.disk.total)}` : "–"}</dd></dl>
+${services ? `<h2>Services</h2><table>${services}</table>` : ""}
+<h2>Usage</h2>${usageHtml}
+<h2>Deploy queue</h2>${queue}${deployLog}${linksHtml}`)
+  }
+
+  const s = ops.system
+  const orphanRss = ops.orphans.reduce((a, x) => a + x.rss, 0)
+  const health = `<table>
+<tr><td>Bot (<code>${esc(ops.bot.unit)}</code>)</td><td class="${ops.bot.active === "active" ? "ok" : "err"}">${esc(ops.bot.active)}</td><td class="dim">since ${esc(ops.bot.since)} · ${esc(ops.bot.restarts)} restarts · ${bytes(ops.bot.rss)}</td></tr>
+<tr><td>Memory</td><td class="${pctClass(s.mem.usedPct, 80, 90)}">${s.mem.usedPct.toFixed(0)}%</td><td class="dim">${bytes(s.mem.available)} free of ${bytes(s.mem.total)}</td></tr>
+<tr><td>Swap</td><td class="${pctClass(s.swap.usedPct, 50, 80)}">${s.swap.usedPct.toFixed(0)}%</td><td class="dim">${bytes(s.swap.used)} of ${bytes(s.swap.total)}${s.swapRate !== null ? ` · ${s.swapRate.toFixed(0)} pages/s` : ""}</td></tr>
+<tr><td>Disk /</td><td class="${pctClass(s.disk.usedPct, 85, 95)}">${s.disk.usedPct.toFixed(0)}%</td><td class="dim">${bytes(s.disk.avail)} free of ${bytes(s.disk.total)}</td></tr>
+<tr><td>CPU load</td><td class="${pctClass((100 * s.load[0]) / s.cpus, 100, 200)}">${s.load[0].toFixed(2)}</td><td class="dim">${s.cpus} cores · 5m ${s.load[1].toFixed(2)} · 15m ${s.load[2].toFixed(2)} · up ${dur(s.uptimeSec)}</td></tr>
+<tr><td>Runs / orphans</td><td>${ops.sessions.length} / ${ops.orphans.length}</td><td class="dim">orphans hold ${bytes(orphanRss)}</td></tr>
+</table>`
+
+  const sessions = ops.sessions.length
+    ? `<table><tr><th>Channel</th><th>Where</th><th>Running</th><th>Memory</th><th>Procs</th><th></th></tr>${ops.sessions.map((x) => `<tr><td>${chan(ctx, x.channelId, x.channelName)}</td><td>${esc(x.remoteHost ?? "local")}</td><td>${dur(x.ageSec)}</td><td>${bytes(x.rss)}</td><td>${x.children + 1}</td><td>${opsButton("stop-session", String(x.pid), "Stop", "The conversation is kept.")}</td></tr>`).join("")}</table>`
+    : `<p class="dim">Nothing running.</p>`
+  const orphans = ops.orphans.length
+    ? `<table><tr><th>Pid</th><th>Command</th><th>From</th><th>Age</th><th>Memory</th><th></th></tr>${ops.orphans.map((x) => `<tr><td>${x.pid}</td><td><code>${esc(x.args || x.comm)}</code></td><td>${chan(ctx, x.channelId, x.channelName)}${x.channelBusy ? ` <span class="warn">(chat is running)</span>` : ""}</td><td>${dur(x.ageSec)}</td><td>${bytes(x.rss)}</td><td>${opsButton("kill-orphan", String(x.pid), "Kill", "Kills it and its children.")}</td></tr>`).join("")}</table>`
+    : `<p class="dim">None.</p>`
+
+  const alerts = ops.alerts.length
+    ? `<table>${ops.alerts.slice(0, 15).map((a) => `<tr><td class="dim" style="white-space:nowrap">${esc(ago(a.at))}</td><td>${esc(a.text).replace(/\*\*(.+?)\*\*/g, "<b>$1</b>").replace(/`([^`]+)`/g, "<code>$1</code>")}</td></tr>`).join("")}</table>`
+    : `<p class="dim">None.</p>`
+
+  const b = ops.disk.breakdown
+  const disk = `${b ? `<table>${b.items.map((i) => `<tr><td>${esc(i.label)}</td><td>${bytes(i.bytes)}</td><td class="dim"><code>${esc(i.path)}</code></td></tr>`).join("")}</table><p class="dim">Measured ${esc(ago(b.at))} (every 30 min).</p>` : `<p class="dim">Not measured yet.</p>`}
+${ops.disk.refreshing ? `<p class="dim">Re-measuring now…</p>` : opsButton("refresh-disk", "-", "Re-measure now")}
+<h3>Cleanups</h3><table>${ops.cleanups.map((c) => `<tr><td>${esc(c.label)}</td><td class="dim">frees ~${bytes(c.estimate)}</td><td>${opsButton("cleanup", c.id, "Run", "Can't be undone.")}</td></tr>`).join("")}</table>`
+
+  const q = ops.automations.deployQueue
+  const queue = `${q.length ? `<table><tr><th>Id</th><th>PRs</th><th>Note</th><th>Queued</th><th></th></tr>${q.map((d) => `<tr><td><code>${esc(d.id)}</code></td><td>${d.prs.map((n) => `#${n}`).join(" ")}</td><td>${esc(maskSecrets(d.note))}</td><td>${esc(ago(d.queued_at))}</td><td>${opsButton("deploy-cancel", d.id, "Cancel", "Removes it from the queue.")}</td></tr>`).join("")}</table>` : `<p class="dim">Empty.</p>`}
+<p>${q.length ? opsButton("deploy-now", "-", "Deploy now", "Restarts the bot now, killing every running turn (it skips the idle check).") : ""} ${opsButton("deploy-restart", "-", "Queue a restart", "Restarts the bot at the next idle moment.")}</p>${deployLog}`
+
+  const w = ops.automations.wakes
+  const wakes = w.length
+    ? `<table><tr><th>Kind</th><th>Channel</th><th>Note</th><th>Due</th><th></th></tr>${w.map((x) => `<tr><td>${esc(x.kind)}${x.jobName ? ` <code>${esc(x.jobName)}</code>` : ""}</td><td>${chan(ctx, x.channelId, null)}</td><td>${esc(maskSecrets(x.note))}</td><td>${esc(x.due)}</td><td>${opsButton("cancel-wake", x.id, "Cancel", "The chat won't be woken.")}</td></tr>`).join("")}</table>`
+    : `<p class="dim">None pending.</p>`
+
+  const services = o.services.map((x) => `<tr><td>${esc(x.name)}</td><td class="${x.state === "active" ? "ok" : "err"}">${esc(x.state)}</td><td>${ops.restartable.includes(x.name.endsWith(".service") ? x.name : `${x.name}.service`) ? opsButton("restart-service", x.name.endsWith(".service") ? x.name : `${x.name}.service`, "Restart", "Drops its connections for a few seconds.") : ""}</td></tr>`).join("")
+  const listed = new Set(o.services.map((x) => (x.name.endsWith(".service") ? x.name : `${x.name}.service`)))
+  const extraRestart = ops.restartable.filter((u) => !listed.has(u)).map((u) => `<tr><td>${esc(u)}</td><td></td><td>${opsButton("restart-service", u, "Restart", "Drops its connections for a few seconds.")}</td></tr>`).join("")
+
+  const r = ops.routing
+  const hostSelect = (current: string) => `<select name="target"><option value="local"${current ? "" : " selected"}>local (this server)</option>${r.hosts.map((h) => `<option value="${esc(h.name)}"${h.name === current ? " selected" : ""}>${esc(h.name)} (${esc(h.label)})</option>`).join("")}</select>`
+  const routeForm = (channelId: string | null, current: string) =>
+    `<form method="post" action="/neoclaw/ops/action" class="inline"><input type="hidden" name="action" value="set-routing">${channelId ? `<input type="hidden" name="channelId" value="${esc(channelId)}">` : `<select name="channelId">${ctx.bridge.knownChannelIds().filter(isSnowflake).filter((id) => !r.channelRouting[id]).map((id) => ({ id, name: ctx.bridge.channelName(id) })).sort((a, c) => a.name.localeCompare(c.name)).map((c) => `<option value="${esc(c.id)}">#${esc(c.name)}</option>`).join("")}</select> `}${hostSelect(current)} <button class="quiet">${channelId ? "Save" : "Route"}</button></form>`
+  const routed = Object.entries(r.channelRouting).map(([id, host]) => ({ id, host, name: ctx.bridge.channelName(id) })).sort((a, c) => a.host.localeCompare(c.host) || a.name.localeCompare(c.name))
+  const routing = r.hosts.length
+    ? `<p class="dim">Takes effect from the channel's next message.</p>${routed.length ? `<table><tr><th>Channel</th><th>Runs on</th></tr>${routed.map((x) => `<tr><td>#${esc(x.name)}</td><td>${routeForm(x.id, x.host)}</td></tr>`).join("")}</table>` : ""}<p>Move another channel: ${routeForm(null, r.hosts[0]!.name)}</p>`
+    : `<p class="dim">No remote hosts configured.</p>`
+
+  const a = ops.automations
+  const more = `<details><summary>Timers (${a.timers.length}) and cron (${a.cron.length})</summary>${a.timers.length ? `<table><tr><th>Timer</th><th>Runs</th><th>Next</th><th>Last</th></tr>${a.timers.map((t) => `<tr><td>${esc(t.unit)}</td><td>${esc(t.activates)}</td><td>${esc(ago(t.next))}</td><td>${esc(ago(t.last))}</td></tr>`).join("")}</table>` : ""}<pre>${esc(maskSecrets(a.cron.join("\n")))}</pre></details>
+<details><summary>Top memory</summary><table>${ops.top.map((p) => `<tr><td>${p.pid}</td><td>${esc(p.comm)}</td><td>${bytes(p.rss)}</td><td class="dim">${dur(p.ageSec)}</td></tr>`).join("")}</table></details>`
+
   return page(
     "Ops",
     ctx,
     "/neoclaw/ops",
-    `<h1>Ops</h1>
-<h2>Health</h2><dl><dt>neo-claw API</dt><dd>${health ? `<span class="ok">up</span>` : `<span class="warn">not reachable</span>`}</dd>
-<dt>Load</dt><dd>${esc(o.load)}</dd><dt>Memory</dt><dd>${bytes(mem.MemAvailable)} free of ${bytes(mem.MemTotal)}; swap ${bytes((mem.SwapTotal ?? 0) - (mem.SwapFree ?? 0))} used of ${bytes(mem.SwapTotal)}</dd>
-<dt>Disk</dt><dd>${o.disk ? `${bytes(o.disk.free)} free of ${bytes(o.disk.total)}` : "–"}</dd></dl>
-${services ? `<h2>Services</h2><table>${services}</table>` : ""}
-<h2>Usage</h2>${usageHtml}
-<h2>Deploy queue</h2>${queue}${o.deployLog ? `<details><summary>deploy-when-idle log (tail)</summary><pre>${esc(o.deployLog)}</pre></details>` : ""}
-${links.length ? `<h2>Dashboards</h2><p>${links.map((l) => `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.label)}</a>`).join(" · ")}</p>` : ""}`,
+    `<h1>Ops</h1>${flash}
+<h2>Health</h2>${health}
+<h2>Running</h2>${sessions}
+<h2>Orphaned processes</h2><p class="dim">Started by a run that has finished. They die at the next bot restart anyway.</p>${orphans}
+<h2>Usage</h2>${pace}${usageHtml}
+<h2>Recent alerts</h2>${alerts}
+<h2>Deploy queue</h2>${queue}
+<h2>Wake-ups and jobs</h2>${wakes}
+<h2>Services</h2><table>${services}${extraRestart}</table>
+<h2>Disk</h2>${disk}
+<h2>Channel routing</h2>${routing}
+<h2>More</h2>${more}${linksHtml}`,
   )
 }
 
