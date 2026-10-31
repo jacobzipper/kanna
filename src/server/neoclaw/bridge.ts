@@ -43,17 +43,47 @@ interface ChatLink {
   lastMessageAt?: number
 }
 
+/** Where a channel sits in Discord, remembered so grouping survives the API being down. */
+interface ChannelPlacement {
+  categoryId: string | null
+  categoryName: string | null
+  categoryPosition: number | null
+  position: number | null
+}
+
 interface PersistedState {
   projects: Record<string, string>
   chats: Record<string, ChatLink>
+  placements?: Record<string, ChannelPlacement>
 }
 
 interface ChannelInfo {
   id: string
   name: string | null
   guildName: string | null
+  categoryId?: string | null
   categoryName: string | null
+  categoryPosition?: number | null
+  position?: number | null
   remoteHost: string | null
+}
+
+export interface SpaceIndexFile {
+  spaces: Record<string, { name: string; guildId: string; enabled: boolean; missionControlChannelId?: string; createdAt: string }>
+  channels: Record<string, { categoryId: string | null; name: string; lastSeenAt: string }>
+}
+
+export interface ChannelSummary {
+  channelId: string
+  name: string
+  projectId: string | null
+  chatId: string | null
+  remoteHost: string | null
+  running: boolean
+  queued: number
+  contextTokens: number | null
+  categoryId: string | null
+  categoryName: string | null
 }
 
 interface ChannelStatus {
@@ -165,6 +195,11 @@ export class NeoClawBridge {
   private archiveCache = new Map<string, { size: number; name: string | null }>()
   private contextTokens = new Map<string, number>()
   private lastCompactAt = new Map<string, number>()
+  private spaceIndex: SpaceIndexFile = { spaces: {}, channels: {} }
+  private spaceIndexAt = 0
+  private sidebarOrder: string[] = []
+  /** Bumps when the neo-claw sidebar order changes (part of the router's sidebar memo key). */
+  orderVersion = 0
 
   constructor(private readonly deps: NeoClawBridgeDeps) {
     this.store = deps.store
@@ -349,9 +384,19 @@ export class NeoClawBridge {
     } catch {
       // API not up yet: fall back to files below
     }
-    const spaces = await readJsonFile<{ channels?: Record<string, { name?: string }> }>(path.join(this.config.contextDir, ".spaces", "index.json"))
-    for (const [id, c] of Object.entries(spaces?.channels ?? {})) {
+    await this.refreshSpaceIndex(0)
+    for (const [id, c] of Object.entries(this.spaceIndex.channels)) {
       if (!info.has(id) && c.name) info.set(id, { id, name: c.name, guildName: null, categoryName: null, remoteHost: null })
+    }
+    // Remember placements the API reported; they group the sidebar while it's down.
+    const placements = (this.state.placements ??= {})
+    for (const c of info.values()) {
+      if (c.categoryId === undefined) continue
+      const next: ChannelPlacement = { categoryId: c.categoryId ?? null, categoryName: c.categoryName ?? null, categoryPosition: c.categoryPosition ?? null, position: c.position ?? null }
+      if (JSON.stringify(placements[c.id]) !== JSON.stringify(next)) {
+        placements[c.id] = next
+        this.scheduleSave()
+      }
     }
     this.channelInfo = info
   }
@@ -424,7 +469,7 @@ export class NeoClawBridge {
 
       const info = this.channelInfo.get(channelId)
       const name = info?.name ?? archiveName ?? channelId
-      const title = `#${name}${remote ? ` (${remote})` : ""}`
+      const title = this.titleFor(channelId, name, remote)
       let projectId = this.state.projects[channelId]
       if (!projectId || !this.store.getProject(projectId)) {
         const project = await this.store.openProject(this.channelDir(channelId), title)
@@ -465,10 +510,183 @@ export class NeoClawBridge {
         changed = (await this.noteActivity(link, s.mtime)) || changed
       }
     }
+    if (this.updateSidebarOrder()) changed = true
     if (changed) {
       this.scheduleSave()
       this.deps.onSidebarChanged()
     }
+  }
+
+  // ---------------------------------------------------------------- grouping
+
+  /** Category, space and position for a channel, from the API, the spaces index or memory. */
+  placement(channelId: string) {
+    const saved = this.state.placements?.[channelId]
+    const categoryId = saved?.categoryId ?? this.spaceIndex.channels[channelId]?.categoryId ?? null
+    const space = categoryId ? this.spaceIndex.spaces[categoryId] : undefined
+    const isSpace = Boolean(space?.enabled)
+    const categoryName = (isSpace ? space?.name : null) ?? saved?.categoryName ?? space?.name ?? null
+    return {
+      categoryId,
+      categoryName,
+      categoryPosition: saved?.categoryPosition ?? null,
+      position: saved?.position ?? null,
+      isSpace,
+      isMission: isSpace && space?.missionControlChannelId === channelId,
+    }
+  }
+
+  private titleFor(channelId: string, name: string, remote: string | null) {
+    const p = this.placement(channelId)
+    const suffix = remote ? ` (${remote})` : ""
+    if (p.isSpace) {
+      return p.isMission
+        ? `◆ ${p.categoryName} › ★ #${name} · mission control${suffix}`
+        : `◆ ${p.categoryName} › #${name}${suffix}`
+    }
+    if (p.categoryId) return `${p.categoryName ?? `category …${p.categoryId.slice(-4)}`} › #${name}${suffix}`
+    return `#${name}${suffix}`
+  }
+
+  /** Spaces first, then categories in Discord order, then the rest; mission control leads its space. */
+  private updateSidebarOrder() {
+    const rows = Object.entries(this.state.projects).map(([channelId, projectId]) => {
+      const p = this.placement(channelId)
+      const title = this.store.getProject(projectId)?.sidebarTitle ?? this.store.getProject(projectId)?.title ?? channelId
+      return { projectId, p, title }
+    })
+    const groupRank = (p: ReturnType<NeoClawBridge["placement"]>) => (p.isSpace ? 0 : p.categoryId ? 1 : 2)
+    rows.sort((a, b) =>
+      groupRank(a.p) - groupRank(b.p) ||
+      (a.p.categoryPosition ?? 1e9) - (b.p.categoryPosition ?? 1e9) ||
+      (a.p.categoryName ?? a.p.categoryId ?? "").localeCompare(b.p.categoryName ?? b.p.categoryId ?? "") ||
+      Number(b.p.isMission) - Number(a.p.isMission) ||
+      (a.p.position ?? 1e9) - (b.p.position ?? 1e9) ||
+      a.title.localeCompare(b.title))
+    const order = rows.map((r) => r.projectId)
+    if (order.join(",") === this.sidebarOrder.join(",")) return false
+    this.sidebarOrder = order
+    this.orderVersion++
+    return true
+  }
+
+  /** Project order for the sidebar in neo-claw mode. */
+  getSidebarOrder() {
+    return this.sidebarOrder
+  }
+
+  // ---------------------------------------------------------------- console helpers
+
+  getSpaceIndex() {
+    return this.spaceIndex
+  }
+
+  /** Re-read .spaces/index.json if the copy in memory is older than maxAgeMs (it's small). */
+  async refreshSpaceIndex(maxAgeMs = 3000) {
+    if (Date.now() - this.spaceIndexAt < maxAgeMs) return this.spaceIndex
+    const spaces = await readJsonFile<Partial<SpaceIndexFile>>(path.join(this.config.contextDir, ".spaces", "index.json"))
+    this.spaceIndex = { spaces: spaces?.spaces ?? {}, channels: spaces?.channels ?? {} }
+    this.spaceIndexAt = Date.now()
+    return this.spaceIndex
+  }
+
+  isApiReachable() {
+    return this.apiReachable
+  }
+
+  overviewLinks() {
+    return this.config.links ?? []
+  }
+
+  channelName(channelId: string) {
+    const projectId = this.state.projects[channelId]
+    const fromApi = this.channelInfo.get(channelId)?.name
+    return fromApi ?? this.spaceIndex.channels[channelId]?.name ?? (projectId ? this.store.getProject(projectId)?.title?.replace(/^.*#/, "") : null) ?? channelId
+  }
+
+  isRemote(channelId: string) {
+    return this.remoteHostFor(channelId)
+  }
+
+  /** Every channel the console knows: mirrored ones, plus API and spaces-index channels. */
+  knownChannelIds() {
+    return [...new Set([...Object.keys(this.state.projects), ...this.channelInfo.keys(), ...Object.keys(this.spaceIndex.channels)])]
+  }
+
+  channelSummary(channelId: string): ChannelSummary {
+    const s = this.statuses.get(channelId)
+    const p = this.placement(channelId)
+    return {
+      channelId,
+      name: this.channelName(channelId),
+      projectId: this.state.projects[channelId] ?? null,
+      chatId: this.currentChatFor(channelId),
+      remoteHost: this.remoteHostFor(channelId),
+      running: Boolean(s?.running) || this.webTurns.get(channelId) === "running",
+      queued: s?.queued ?? 0,
+      contextTokens: this.contextTokens.get(channelId) ?? null,
+      categoryId: p.categoryId,
+      categoryName: p.categoryName,
+    }
+  }
+
+  /** GET a neo-claw API endpoint as JSON; null when the API is down. */
+  async apiGet<T>(pathname: string, timeoutMs = 4000): Promise<T | null> {
+    try {
+      const res = await this.api(pathname, { signal: AbortSignal.timeout(timeoutMs) })
+      if (!res.ok) return null
+      return (await res.json()) as T
+    } catch {
+      return null
+    }
+  }
+
+  /** /space init | off through neo-claw. Returns the API's JSON or throws with its error. */
+  async spaceAction(action: "init" | "off", body: Record<string, unknown>, user: SessionUser, mirror: boolean) {
+    let res: Response
+    try {
+      res = await this.api(`/api/space/${action}`, {
+        method: "POST",
+        body: JSON.stringify({ ...body, discordUserId: user.discordId, displayName: user.displayName, mirror }),
+        signal: AbortSignal.timeout(30_000),
+      })
+    } catch {
+      throw new Error("neo-claw's web API isn't reachable, so space actions are unavailable until the bot runs a build with it.")
+    }
+    const json = (await res.json().catch(() => ({}))) as Record<string, unknown>
+    if (!res.ok) throw new Error(String(json.error ?? `neo-claw refused (${res.status})`))
+    await this.refreshSpacesSoon()
+    return json
+  }
+
+  /** /space backfill: a normal turn in mission control, streamed like a web turn. */
+  async startBackfill(categoryId: string, missionChannelId: string, user: SessionUser, mirror: boolean) {
+    this.webTurns.set(missionChannelId, "sending")
+    this.deps.onSidebarChanged()
+    let res: Response
+    try {
+      res = await this.api("/api/space/backfill", {
+        method: "POST",
+        body: JSON.stringify({ categoryId, discordUserId: user.discordId, displayName: user.displayName, mirror }),
+      })
+    } catch {
+      this.webTurns.delete(missionChannelId)
+      this.deps.onSidebarChanged()
+      throw new Error("neo-claw's web API isn't reachable, so backfill is unavailable until the bot runs a build with it.")
+    }
+    if (!res.ok || !(res.headers.get("content-type") ?? "").includes("text/event-stream")) {
+      this.webTurns.delete(missionChannelId)
+      this.deps.onSidebarChanged()
+      const body = (await res.json().catch(() => ({}))) as { error?: string }
+      throw new Error(body.error ?? `neo-claw refused the backfill (${res.status})`)
+    }
+    void this.consumeTurnStream(missionChannelId, res)
+  }
+
+  private async refreshSpacesSoon() {
+    await this.refreshSpaceIndex(0)
+    this.channelInfoAt = 0
+    void this.guard("scan", () => this.scan())
   }
 
   private async noteActivity(link: ChatLink, at: number) {

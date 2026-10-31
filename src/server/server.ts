@@ -16,7 +16,8 @@ import { createAuthManager } from "./auth"
 import { loadNeoClawConfig } from "./neoclaw/config"
 import { createNeoClawAuthManager } from "./neoclaw/auth"
 import { NeoClawBridge } from "./neoclaw/bridge"
-import { renderOverviewPage } from "./neoclaw/overview-page"
+import { handleConsole } from "./neoclaw/pages"
+import { Stack } from "./neoclaw/stack"
 import { classifyCloudRequest, isAllowedCloudWsUpgrade, type CloudRequestClass } from "./cloud/guard"
 import { createCloudRuntime, type CloudRuntime } from "./cloud"
 import { createFleetCache } from "./cloud/fleet"
@@ -386,6 +387,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
         onSidebarChanged: () => router.scheduleBroadcast(),
       })
     : null
+  const neoClawStack = neoClawConfig && neoClawBridge ? new Stack(neoClawConfig, neoClawBridge) : null
   if (neoClawBridge) {
     // Mirrored sessions are filled from neo-claw's files the first time they
     // are opened.
@@ -660,8 +662,11 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
             if (url.pathname === "/api/neoclaw/overview" && neoClawBridge) {
               return Response.json(await neoClawBridge.overview(), { headers: { "Cache-Control": "no-store" } })
             }
-            if (url.pathname === "/neoclaw" && neoClawBridge) {
-              return renderOverviewPage(await neoClawBridge.overview())
+            if ((url.pathname === "/neoclaw" || url.pathname.startsWith("/neoclaw/")) && neoClawBridge && neoClawStack) {
+              const user = neoClawAuth.getUser(req)
+              if (!user) return new Response("Unauthorized", { status: 401 })
+              const res = await handleConsole(req, url, { stack: neoClawStack, bridge: neoClawBridge, user, validateOrigin: (r) => neoClawAuth.validateOrigin(r) })
+              if (res) return res
             }
             if (url.pathname === "/api/neoclaw/me") {
               return Response.json(neoClawAuth.getUser(req), { headers: { "Cache-Control": "no-store" } })

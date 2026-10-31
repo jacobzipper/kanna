@@ -45,6 +45,18 @@ export interface NeoClawConfig {
   tailBytes?: number
   /** Default for the per-message "mirror to Discord" toggle (default true). */
   mirrorDefault?: boolean
+  /** neo-claw repo checkout: bundled skills, deploy log (default: the folder of neoClawConfigPath). */
+  neoClawRoot?: string
+  /** User-level Claude Code skills (default ~/.claude/skills). */
+  globalSkillsDir?: string
+  /** User-level Claude Code settings: hooks, MCP servers (default ~/.claude/settings.json). Env values are never shown. */
+  claudeSettingsPath?: string
+  /** graphiti memory sidecar behind memory-search, e.g. http://127.0.0.1:7878 (optional). */
+  memorySidecarUrl?: string
+  /** `neo-claw-node` CLI for the compute-node panel (optional). */
+  nodeCli?: string
+  /** systemd units whose state the ops page shows. */
+  services?: string[]
 }
 
 export interface LoadedNeoClawConfig extends NeoClawConfig {
@@ -91,6 +103,9 @@ export function loadNeoClawConfig(env: Record<string, string | undefined> = proc
     contextDir: expandHome(raw.contextDir),
     claudeProjectsDir: expandHome(raw.claudeProjectsDir),
     users: raw.users.map((u) => ({ ...u, username: u.username.toLowerCase() })),
+    neoClawRoot: raw.neoClawRoot ? expandHome(raw.neoClawRoot) : raw.neoClawConfigPath ? path.dirname(expandHome(raw.neoClawConfigPath)) : undefined,
+    globalSkillsDir: expandHome(raw.globalSkillsDir ?? "~/.claude/skills"),
+    claudeSettingsPath: expandHome(raw.claudeSettingsPath ?? "~/.claude/settings.json"),
     apiSecret,
     remoteRouting,
   }

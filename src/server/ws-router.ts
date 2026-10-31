@@ -457,6 +457,7 @@ export function createWsRouter({
     const memoKey = [
       store.stateVersion,
       sidebarInputsVersion,
+      neoClaw?.orderVersion ?? 0,
       Math.floor(Date.now() / SIDEBAR_CLOCK_BUCKET_MS),
       JSON.stringify([...activeStatuses].sort()),
       JSON.stringify([...drainingChatIds].sort()),
@@ -476,7 +477,8 @@ export function createWsRouter({
       return sidebarMemo.entry
     }
     const data = deriveSidebarData(store.state, activeStatuses, {
-      sidebarProjectOrder: store.getSidebarProjectOrder(),
+      // neo-claw mode: spaces, then Discord categories, then the rest.
+      sidebarProjectOrder: neoClaw ? neoClaw.getSidebarOrder() : store.getSidebarProjectOrder(),
       drainingChatIds,
       pendingToolKinds,
       pendingUserInputPreviews,

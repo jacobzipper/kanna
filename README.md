@@ -49,11 +49,19 @@ That's it. Kanna opens in your browser at [`localhost:3210`](http://localhost:32
 Set `NEO_CLAW_KANNA_CONFIG=/path/to/config.json` and Kanna becomes a web console for a [neo-claw](https://github.com/Retail-Hedging/neo-claw) Discord bot:
 
 - each Discord channel shows as a project, and each Claude session as a chat; remote-host channels are labelled `(remote)`.
+- The sidebar follows Discord: Spaces first (`◆ space › #chat`, mission control on top and marked `★`), then the other categories in Discord order, then uncategorized channels.
 - Transcripts come from the bot's session files, including nested subagents and compactions, with live status (idle, running, queued).
 - Web messages go through neo-claw's local web API, so they share the channel's session and queue. They are attributed to the signed-in user's Discord ID, with a per-message "Mirror to Discord" toggle.
 - Users have their own logins, and every route except `/health` requires sign-in.
 - Only the Claude provider is offered, and terminals are disabled.
-- `/neoclaw` shows an overview page: channels, context use, the deploy queue and link-outs.
+- `/neoclaw` is a console of plain server-rendered pages:
+  - **Spaces**: each space's SPACE.md (rendered, with in-place editing: atomic write, a timestamped backup in `.history/`, a conflict check and a diff), member chats with status and context use, shared skills and info. Init, off and backfill run through neo-claw's web API (backfill streams into the mission-control chat), plus space-scoped search.
+  - **Skills**: global, bundled, space and per-chat skills, with where each is in effect, the file tree and SKILL.md.
+  - **Memory**: per chat, the auto-memory folder, the channel's rolling summary and archive stats, and memory-search facts and episodes when the sidecar runs.
+  - **Hooks & settings**: hooks with their script source, the compaction window and per-chat model and effort. Env values are never shown, only key names, and token-like strings are masked on every page.
+  - **MCP servers**, with tools listed on demand.
+  - **Jobs** (wake-on-exit jobs and timers) and terminals, **Nodes** (`neo-claw-node list`) and **Ops** (services, load, deploy queue, usage).
+  - **Search**: the same `search_channels` tool the chats use.
 
 Keep the config file outside the repo, mode 600:
 
@@ -68,9 +76,18 @@ Keep the config file outside the repo, mode 600:
   "users": [
     { "username": "alice", "displayName": "Alice", "discordId": "<discord user id>", "passwordHash": "<Bun.password.hash output>" }
   ],
-  "links": [{ "label": "Dashboard", "url": "https://dashboard.example.com" }]
+  "links": [{ "label": "Dashboard", "url": "https://dashboard.example.com" }],
+
+  "neoClawRoot": "~/neo-claw",
+  "globalSkillsDir": "~/.claude/skills",
+  "claudeSettingsPath": "~/.claude/settings.json",
+  "memorySidecarUrl": "http://127.0.0.1:7878",
+  "nodeCli": "/usr/local/bin/neo-claw-node",
+  "services": ["neo-claw", "caddy"]
 }
 ```
+
+The last block is optional. It feeds the console pages: `neoClawRoot` defaults to the folder of `neoClawConfigPath`, and `services` lists the systemd units shown on the Ops page.
 
 Run it bound to localhost behind a TLS reverse proxy, for example with `bun run ./src/server/cli.ts --port 8762 --host 127.0.0.1 --no-open --no-cloud --strict-port`.
 
