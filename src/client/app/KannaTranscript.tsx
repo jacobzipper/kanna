@@ -605,7 +605,7 @@ const TranscriptSingleRow = memo(function TranscriptSingleRow({
       ? null
       : message.source
         ? <SourcedMessage key={message.id} content={message.content} source={message.source} attachments={message.attachments} flash={flash} />
-        : <UserMessage key={message.id} content={message.content} attachments={message.attachments} flash={flash} />
+        : <UserMessage key={message.id} content={message.content} attachments={message.attachments} flash={flash} author={message.author} />
     rendered = showsOwnBoundary ? (
       // 20px apart, the gap two transcript rows sit at (see the row's padding
       // in ChatTranscriptViewport), so the boundary reads as the row above.

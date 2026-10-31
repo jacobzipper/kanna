@@ -1977,11 +1977,19 @@ export interface ToolResultEntry extends TranscriptEntryBase {
   structuredResult?: unknown
 }
 
+/** Who sent a prompt in a shared (neo-claw) chat, shown above the bubble. */
+export interface UserPromptAuthor {
+  name: string
+  discordId?: string
+  via?: "discord" | "web" | "wake"
+}
+
 export interface UserPromptEntry extends TranscriptEntryBase {
   kind: "user_prompt"
   content: string
   attachments?: ChatAttachment[]
   steered?: boolean
+  author?: UserPromptAuthor
   /** Set when something other than the user sent it. See `MessageSource`. */
   source?: MessageSource
 }
@@ -2548,7 +2556,7 @@ export type HydratedToolCall = {
 }[NormalizedToolCall["toolKind"]]
 
 export type HydratedTranscriptMessage =
-  | ({ kind: "user_prompt"; content: string; attachments?: ChatAttachment[]; steered?: boolean; source?: MessageSource; id: string; messageId?: string; timestamp: string; hidden?: boolean })
+  | ({ kind: "user_prompt"; content: string; attachments?: ChatAttachment[]; steered?: boolean; source?: MessageSource; author?: UserPromptAuthor; id: string; messageId?: string; timestamp: string; hidden?: boolean })
   | ({ kind: "system_init"; model: string; tools: string[]; agents: string[]; slashCommands: string[]; mcpServers: McpServerInfo[]; provider: AgentProvider; id: string; messageId?: string; timestamp: string; hidden?: boolean; debugRaw?: string })
   | ({ kind: "account_info"; accountInfo: AccountInfo; id: string; messageId?: string; timestamp: string; hidden?: boolean })
   | ({ kind: "assistant_text"; text: string; id: string; messageId?: string; timestamp: string; hidden?: boolean })

@@ -82,6 +82,7 @@ function hydrateEntry(entry: Exclude<TranscriptEntry, { kind: "tool_result" }>):
         content: entry.content,
         attachments: entry.attachments ?? [],
         steered: entry.steered,
+        ...(entry.author ? { author: entry.author } : {}),
         // Only a sender it draws: an old ticket reply reads as the user's prompt.
         ...(drawnMessageSource(entry.source) ? { source: entry.source } : {}),
       }

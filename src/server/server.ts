@@ -13,6 +13,10 @@ import {
   type CloudWsEndpointResponse,
 } from "../shared/cloud-api"
 import { createAuthManager } from "./auth"
+import { loadNeoClawConfig } from "./neoclaw/config"
+import { createNeoClawAuthManager } from "./neoclaw/auth"
+import { NeoClawBridge } from "./neoclaw/bridge"
+import { renderOverviewPage } from "./neoclaw/overview-page"
 import { classifyCloudRequest, isAllowedCloudWsUpgrade, type CloudRequestClass } from "./cloud/guard"
 import { createCloudRuntime, type CloudRuntime } from "./cloud"
 import { createFleetCache } from "./cloud/fleet"
@@ -180,7 +184,11 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   const readLlmProvider = () => readLlmProviderSnapshot(machine.llmProviderFile)
   const writeLlmProvider = (value: Parameters<typeof writeLlmProviderSnapshot>[0]) =>
     writeLlmProviderSnapshot(value, machine.llmProviderFile)
-  const auth = options.password ? createAuthManager(options.password, { trustProxy: options.trustProxy ?? false }) : null
+  // neo-claw mode (NEO_CLAW_KANNA_CONFIG): per-user logins, channels as
+  // projects, turns through neo-claw. Behind a local reverse proxy.
+  const neoClawConfig = loadNeoClawConfig()
+  const neoClawAuth = neoClawConfig ? createNeoClawAuthManager(neoClawConfig, { trustProxy: true }) : null
+  const auth = neoClawAuth ?? (options.password ? createAuthManager(options.password, { trustProxy: options.trustProxy ?? false }) : null)
   const diagnostics = new PerformanceLog(options.dataDir ?? getDataDir(homedir()), undefined, options.update?.version)
   const store = new EventStore(options.dataDir, diagnostics)
   const diffStore = new DiffStore(store.dataDir)
@@ -202,6 +210,8 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
   let discoveredProjects: DiscoveredProject[] = []
 
   async function refreshDiscovery() {
+    // neo-claw mode lists channels, never the machine's other projects.
+    if (neoClawConfig) return discoveredProjects
     discoveredProjects = await discoverProjects()
     return discoveredProjects
   }
@@ -368,6 +378,26 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     },
   })
 
+  const neoClawBridge = neoClawConfig
+    ? new NeoClawBridge({
+        store,
+        config: neoClawConfig,
+        onChatChanged: (chatId) => router.scheduleChatStateBroadcast(chatId),
+        onSidebarChanged: () => router.scheduleBroadcast(),
+      })
+    : null
+  if (neoClawBridge) {
+    // Mirrored sessions are filled from neo-claw's files the first time they
+    // are opened.
+    const prepare = store.prepareTranscript.bind(store)
+    store.prepareTranscript = async (chatId: string) => {
+      await neoClawBridge.ensureImported(chatId).catch((error) => {
+        console.warn(`${LOG_PREFIX} neo-claw import failed for ${chatId}:`, error)
+      })
+      return await prepare(chatId)
+    }
+  }
+
   router = createWsRouter({
     diagnostics,
     store,
@@ -396,7 +426,10 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     machineDisplayName,
     updateManager,
     providerAuth,
+    neoClaw: neoClawBridge,
   })
+  // Links its chats before the startup GC below runs, so those are protected.
+  await neoClawBridge?.start()
   // Overlay the account's live Cursor and Codex model lists on the static
   // catalog (no-op when the CLI is missing or logged out); broadcasts on change.
   void agent.refreshCursorModelCatalog()
@@ -569,6 +602,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
               data: {
                 subscriptions: new Map(),
                 snapshotSignatures: new Map(),
+                neoClawUser: neoClawAuth?.getUser(req) ?? undefined,
               },
             })
             return upgraded ? undefined : new Response("WebSocket upgrade failed", { status: 400 })
@@ -596,6 +630,42 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
               return withOriginAgentCluster(new Response("Unauthorized", { status: 401 }))
             }
             return withOriginAgentCluster(new Response("Not found", { status: 404 }))
+          }
+
+          if (neoClawAuth) {
+            if (url.pathname === "/auth/login") {
+              if (req.method === "GET") {
+                return neoClawAuth.isAuthenticated(req) ? neoClawAuth.redirectToApp(req) : neoClawAuth.loginPage(req)
+              }
+              if (req.method === "POST") return await neoClawAuth.handleLogin(req, "/")
+              return new Response(null, { status: 405, headers: { Allow: "GET, POST" } })
+            }
+            const open = url.pathname === "/health" || url.pathname === "/auth/status" || url.pathname === "/auth/logout"
+            if (!open && !neoClawAuth.isAuthenticated(req)) {
+              if (url.pathname === "/ws" || url.pathname.startsWith("/api/")) {
+                return Response.json({ error: "Unauthorized" }, { status: 401 })
+              }
+              if (req.method === "GET" || req.method === "HEAD") {
+                const next = `${url.pathname}${url.search}`
+                return new Response(null, { status: 302, headers: { Location: `/auth/login?next=${encodeURIComponent(next)}`, "Cache-Control": "no-store" } })
+              }
+              return new Response("Unauthorized", { status: 401 })
+            }
+            if (url.pathname === "/ws" && !neoClawAuth.validateOrigin(req)) {
+              return new Response("Forbidden", { status: 403 })
+            }
+            if (url.pathname === "/health") {
+              return Response.json({ ok: true })
+            }
+            if (url.pathname === "/api/neoclaw/overview" && neoClawBridge) {
+              return Response.json(await neoClawBridge.overview(), { headers: { "Cache-Control": "no-store" } })
+            }
+            if (url.pathname === "/neoclaw" && neoClawBridge) {
+              return renderOverviewPage(await neoClawBridge.overview())
+            }
+            if (url.pathname === "/api/neoclaw/me") {
+              return Response.json(neoClawAuth.getUser(req), { headers: { "Cache-Control": "no-store" } })
+            }
           }
 
           if (url.pathname === "/auth/status") {
@@ -850,6 +920,7 @@ export async function startKannaServer(options: StartKannaServerOptions = {}) {
     // attached at pair time is ours to take down.
     await selfPairedCloud?.stop()
     clearInterval(staleEmptyChatPruneInterval)
+    neoClawBridge?.stop()
     clearInterval(staleChatAutoArchiveInterval)
     clearInterval(staleChatDeleteInterval)
     worktreeProbe.stop()

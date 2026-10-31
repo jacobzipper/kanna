@@ -19,7 +19,7 @@ import { killLocalHttpServer, listLocalHttpServers } from "./local-http-servers"
 import type { PortTunnelManager } from "./port-tunnels"
 import { cloneRepository, createDirectory, ensureProjectDirectory, initializeProjectDirectory, listDirectory, resolveClonePath, resolveLocalPath } from "./paths"
 import { listRecentGitHubRepos } from "./github"
-import { SERVER_PROVIDERS, applyPiFaveModels } from "./provider-catalog"
+import { visibleServerProviders, applyPiFaveModels } from "./provider-catalog"
 import { readProjectQuickActions, writeProjectQuickActions } from "./project-quick-actions"
 import { buildSecretsList } from "./secrets"
 import { installSkill, listGlobalSkillsWithSources, listInstalledSkills, searchSkills, uninstallSkill } from "./skills"
@@ -30,6 +30,8 @@ import type { ProjectIcons } from "./project-icons"
 import type { ProviderAuthManager } from "./provider-auth"
 import type { UpdateManager } from "./update-manager"
 import type { UsageLimitsManager } from "./usage-limits"
+import type { NeoClawBridge } from "./neoclaw/bridge"
+import type { SessionUser } from "./neoclaw/auth"
 import { deriveChatSnapshot, deriveChatTouchedFiles, deriveLocalProjectsSnapshot, deriveSidebarData } from "./read-models"
 import type {
   AppSettingsSnapshot,
@@ -100,9 +102,13 @@ export interface ClientState {
    * push waiting out the interval, if any.
    */
   chatBackgroundPushes?: Map<string, { at: number; timer: ReturnType<typeof setTimeout> | null }>
+  /** neo-claw mode: who this socket is logged in as (turns are sent as them). */
+  neoClawUser?: SessionUser
 }
 
 interface CreateWsRouterArgs {
+  /** neo-claw mode: channels and sessions come from neo-claw, and turns go to it. */
+  neoClaw?: NeoClawBridge | null
   diagnostics?: PerformanceLog
   store: EventStore
   diffStore: Pick<DiffStore, "getProjectSnapshot" | "getSnapshotVersion" | "refreshSnapshot" | "initializeGit" | "getGitHubPublishInfo" | "checkGitHubRepoAvailability" | "publishToGitHub" | "listBranches" | "previewMergeBranch" | "mergeBranch" | "syncBranch" | "checkoutBranch" | "createBranch" | "generateCommitMessage" | "commitFiles" | "discardFile" | "ignoreFile" | "readPatch" | "readCommit" | "readBranch">
@@ -256,6 +262,7 @@ export function createWsRouter({
   providerAuth,
   backgroundChatPushIntervalMs = BACKGROUND_CHAT_PUSH_INTERVAL_MS,
   chatCommands: providedChatCommands,
+  neoClaw = null,
 }: CreateWsRouterArgs) {
   const sockets = new Set<ServerWebSocket<ClientState>>()
   let pendingBroadcastTimer: ReturnType<typeof setTimeout> | null = null
@@ -284,7 +291,23 @@ export function createWsRouter({
    * subagent. The fallback is for test fakes that predate the second.
    */
   function getChatStatuses() {
-    return agent.getChatStatuses?.() ?? agent.getActiveStatuses()
+    const statuses = agent.getChatStatuses?.() ?? agent.getActiveStatuses()
+    if (!neoClaw) return statuses
+    const merged = new Map(statuses)
+    for (const [chatId, status] of neoClaw.getStatuses()) merged.set(chatId, status)
+    return merged
+  }
+
+  /** The Discord channel a neo-claw-mode send or stop is for. */
+  function neoClawChannelFor(chatId?: string, projectId?: string): string {
+    if (!neoClaw) throw new Error("neo-claw mode is off")
+    const direct = neoClaw.resolveChannel({ chatId, projectId })
+    if (direct) return direct
+    // A chat made in the UI ("New chat") belongs to its channel's project.
+    const chat = chatId ? store.getChat(chatId) : null
+    const viaProject = chat ? neoClaw.resolveChannel({ projectId: chat.projectId }) : null
+    if (viaProject) return viaProject
+    throw new Error("This chat isn't a neo-claw channel")
   }
 
   function getProtectedChatIds() {
@@ -295,6 +318,8 @@ export function createWsRouter({
     return new Set([
       ...activeStatuses.keys(),
       ...drainingChatIds.values(),
+      // Mirrored sessions are neo-claw's, not Kanna's to archive or prune.
+      ...(neoClaw?.managedChatIds() ?? []),
     ])
   }
 
@@ -488,7 +513,7 @@ export function createWsRouter({
    * the catalog put those pickers back on the static list after any write.
    */
   function withProviderCatalog(snapshot: AppSettingsSnapshot): AppSettingsSnapshot {
-    return { ...snapshot, availableProviders: [...SERVER_PROVIDERS] }
+    return { ...snapshot, availableProviders: visibleServerProviders() }
   }
 
   /**
@@ -1802,6 +1827,22 @@ export function createWsRouter({
           return
         }
         case "chat.send": {
+          if (neoClaw) {
+            const channelId = neoClawChannelFor(command.chatId, command.projectId)
+            const user = ws.data.neoClawUser
+            if (!user) throw new Error("Not signed in")
+            if ((command.attachments?.length ?? 0) > 0) throw new Error("Attachments aren't supported for neo-claw turns yet")
+            const result = await neoClaw.sendTurn({
+              channelId,
+              text: command.content,
+              user,
+              mirror: command.neoClawMirror ?? neoClaw.mirrorDefault,
+              steer: false,
+            })
+            send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result: { chatId: result.chatId ?? command.chatId } })
+            scheduleBroadcast()
+            return
+          }
           await finishChatCommand(ws, id, await chatCommands.send(command))
           return
         }
@@ -1961,6 +2002,11 @@ export function createWsRouter({
           return
         }
         case "chat.cancel": {
+          if (neoClaw) {
+            await neoClaw.stopTurn(neoClawChannelFor(command.chatId))
+            send(ws, { v: PROTOCOL_VERSION, type: "ack", id })
+            return
+          }
           await finishChatCommand(ws, id, await chatCommands.cancel(command.chatId, { cascade: command.cascade }))
           return
         }
@@ -2020,10 +2066,32 @@ export function createWsRouter({
           return
         }
         case "message.enqueue": {
+          if (neoClaw) {
+            // neo-claw queues behind the running turn itself (per channel),
+            // or hands the message to the running turn when steering.
+            const user = ws.data.neoClawUser
+            if (!user) throw new Error("Not signed in")
+            if ((command.attachments?.length ?? 0) > 0) throw new Error("Attachments aren't supported for neo-claw turns yet")
+            const result = await neoClaw.sendTurn({
+              channelId: neoClawChannelFor(command.chatId),
+              text: command.content,
+              user,
+              mirror: command.neoClawMirror ?? neoClaw.mirrorDefault,
+              steer: command.steer === true,
+            })
+            send(ws, { v: PROTOCOL_VERSION, type: "ack", id, result: { queuedMessageId: result.steered ? "neo-claw-steered" : "neo-claw-queued" } })
+            scheduleBroadcast()
+            return
+          }
           await finishChatCommand(ws, id, await chatCommands.enqueue(command))
           return
         }
         case "message.steer": {
+          if (neoClaw) {
+            // Nothing is held in Kanna's queue in neo-claw mode.
+            send(ws, { v: PROTOCOL_VERSION, type: "ack", id })
+            return
+          }
           await finishChatCommand(ws, id, await chatCommands.steer(command))
           return
         }
@@ -2032,6 +2100,8 @@ export function createWsRouter({
           return
         }
         case "terminal.create": {
+          // A web shell on this box is out of scope for the neo-claw console.
+          if (neoClaw) throw new Error("Terminals are disabled in neo-claw mode")
           // projectId null → the dev-box home terminal (full-screen Terminal
           // page): a shell at $HOME instead of a project directory.
           let projectPath: string

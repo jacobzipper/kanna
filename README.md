@@ -44,6 +44,36 @@ kanna
 
 That's it. Kanna opens in your browser at [`localhost:3210`](http://localhost:3210).
 
+## neo-claw mode (this fork)
+
+Set `NEO_CLAW_KANNA_CONFIG=/path/to/config.json` and Kanna becomes a web console for a [neo-claw](https://github.com/Retail-Hedging/neo-claw) Discord bot:
+
+- each Discord channel shows as a project, and each Claude session as a chat; remote-host channels are labelled `(remote)`.
+- Transcripts come from the bot's session files, including nested subagents and compactions, with live status (idle, running, queued).
+- Web messages go through neo-claw's local web API, so they share the channel's session and queue. They are attributed to the signed-in user's Discord ID, with a per-message "Mirror to Discord" toggle.
+- Users have their own logins, and every route except `/health` requires sign-in.
+- Only the Claude provider is offered, and terminals are disabled.
+- `/neoclaw` shows an overview page: channels, context use, the deploy queue and link-outs.
+
+Keep the config file outside the repo, mode 600:
+
+```json
+{
+  "contextDir": "~/neo-claw-context",
+  "claudeProjectsDir": "~/.claude/projects",
+  "neoClawConfigPath": "~/neo-claw/neo-claw.config.json",
+  "apiUrl": "http://127.0.0.1:8761",
+  "apiSecretFile": "/etc/neo-claw-kanna/neo-claw-api.secret",
+  "cookieSecret": "<64 hex chars>",
+  "users": [
+    { "username": "alice", "displayName": "Alice", "discordId": "<discord user id>", "passwordHash": "<Bun.password.hash output>" }
+  ],
+  "links": [{ "label": "Dashboard", "url": "https://dashboard.example.com" }]
+}
+```
+
+Run it bound to localhost behind a TLS reverse proxy, for example with `bun run ./src/server/cli.ts --port 8762 --host 127.0.0.1 --no-open --no-cloud --strict-port`.
+
 ## Features
 
 - **Multi-provider support** — switch between Claude, Codex (OpenAI), Cursor, Grok Build, and Pi from the chat input, with per-provider model selection, reasoning effort controls, and Codex fast mode

@@ -291,6 +291,8 @@ export type ClientCommand =
       effort?: string
       planMode?: boolean
       autoPlan?: boolean
+      /** neo-claw mode: also post this message (and the reply) in the Discord channel. */
+      neoClawMirror?: boolean
     }
   | { type: "chat.refreshDiffs"; chatId: string }
   | { type: "chat.initGit"; chatId: string }
@@ -363,6 +365,8 @@ export type ClientCommand =
       type: "message.enqueue"
       chatId: string
       content: string
+      /** neo-claw mode: also post this message (and the reply) in the Discord channel. */
+      neoClawMirror?: boolean
       attachments?: ChatAttachment[]
       provider?: AgentProvider
       model?: string

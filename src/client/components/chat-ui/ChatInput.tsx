@@ -36,6 +36,7 @@ import { useAppSettingsStore } from "../../stores/appSettingsStore"
 import { resolveModifiedEnter, shouldSteerSubmit } from "../../../shared/submit-mode"
 import { SignInDialog } from "../auth/SignInDialog"
 import { ChatModePicker } from "./ChatPreferenceControls"
+import { NeoClawMirrorToggle } from "../neoclaw/NeoClawMirrorToggle"
 import { ComposerHarnessMenu } from "./ComposerHarnessMenu"
 import { AttachmentFileCard, AttachmentImageCard } from "../messages/AttachmentCard"
 import { getChatViewer, useViewerStore, viewerAttachmentFromChat } from "../../stores/viewerStore"
@@ -1438,6 +1439,7 @@ const ChatInputInner = forwardRef<ChatInputHandle, Props>(function ChatInput({
   return (
     <div>
       <div className={cn("px-3 pt-0 pb-3", isStandalone && "px-5 pb-5")}>
+        <NeoClawMirrorToggle />
         <div className="relative max-w-[840px] mx-auto rounded-[32px]">
           {skillMenuOpen ? (
             <div

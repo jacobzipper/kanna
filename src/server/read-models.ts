@@ -17,7 +17,7 @@ import type { WorkingTreeProbe } from "./diff-store"
 import type { ProjectRepoLabel } from "./worktree-probe"
 import type { ChatRecord, StoreState, TouchedFile } from "./events"
 import { resolveLocalPath } from "./paths"
-import { SERVER_PROVIDERS } from "./provider-catalog"
+import { visibleServerProviders } from "./provider-catalog"
 import { buildTranscriptOutline } from "../shared/transcript-window"
 import type { TranscriptOutlineEntry } from "../shared/types"
 
@@ -525,7 +525,7 @@ export function deriveChatSnapshot(
     })),
     messages: transcript.messages,
     startIndex: transcript.startIndex,
-    availableProviders: [...SERVER_PROVIDERS],
+    availableProviders: visibleServerProviders(),
     readAnchor: transcript.readAnchor,
     // The outline covers the whole chat even when `messages` starts at a
     // window; the store caches it per transcript and only rebuilds when a

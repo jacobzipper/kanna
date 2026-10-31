@@ -50,6 +50,15 @@ function createServerProviders(): ProviderCatalogEntry[] {
 
 export const SERVER_PROVIDERS: ProviderCatalogEntry[] = createServerProviders()
 
+/**
+ * Providers offered to clients. A neo-claw deployment is Claude-only: turns
+ * run through neo-claw, which only drives the official `claude` binary.
+ */
+export function visibleServerProviders(): ProviderCatalogEntry[] {
+  if (process.env.NEO_CLAW_KANNA_CONFIG) return SERVER_PROVIDERS.filter((provider) => provider.id === "claude")
+  return [...SERVER_PROVIDERS]
+}
+
 export function resetServerProvidersForTests() {
   SERVER_PROVIDERS.splice(0, SERVER_PROVIDERS.length, ...createServerProviders())
 }

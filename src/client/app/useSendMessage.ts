@@ -5,6 +5,7 @@ import { NEW_CHAT_COMPOSER_ID, useChatPreferencesStore } from "../stores/chatPre
 import { generateUUID } from "../lib/utils"
 import { getSidebarProjectGroups } from "../stores/sidebarStore"
 import { clearSending, markSending } from "../stores/pendingSendStore"
+import { neoClawSendFields } from "../stores/neoClawStore"
 import {
   composerStateFromSendOptions,
   countMatchingUserPrompts,
@@ -80,6 +81,7 @@ export function useSendMessage(params: {
           // Only meaningful here: off a running turn there is nothing to
           // interrupt, and the message starts immediately either way.
           steer: options?.steer,
+          ...neoClawSendFields(),
         })
         setCommandError(null)
         return
@@ -146,7 +148,20 @@ export function useSendMessage(params: {
         modelOptions: options?.modelOptions,
         planMode: options?.planMode,
         autoPlan: options?.autoPlan,
+        ...neoClawSendFields(),
       })
+      // neo-claw mode: a send from a chat that isn't the channel's live
+      // session lands in the live one, which the ack names.
+      const movedTo = activeChatId && result.chatId && result.chatId !== activeChatId ? result.chatId : null
+      if (movedTo) {
+        setOptimisticUserPrompts((current) => current.map((prompt) => (
+          prompt.id === optimisticId ? { ...prompt, scopeId: movedTo } : prompt
+        )))
+        setOptimisticProcessing({ scopeId: movedTo, ackedAt: performance.now() })
+        navigate(`/chat/${movedTo}`)
+        setCommandError(null)
+        return
+      }
       setOptimisticProcessing((current) => {
         if (!current) return current
         const nextScopeId = !activeChatId && result.chatId ? result.chatId : current.scopeId

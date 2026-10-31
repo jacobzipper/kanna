@@ -1,5 +1,5 @@
 import { useMemo, useRef } from "react"
-import type { ChatAttachment } from "../../../shared/types"
+import type { ChatAttachment, UserPromptAuthor } from "../../../shared/types"
 import { stripSystemMessages } from "../../../shared/message-preview"
 import { CLAMP_LINES, ClampedMessageText, FOLD_SURFACE_ATTRIBUTE } from "./ClampedMessageText"
 import { AttachmentFileCard, AttachmentImageCard } from "./AttachmentCard"
@@ -11,6 +11,8 @@ import { cn } from "../../lib/utils"
 interface Props {
   content: string
   attachments?: ChatAttachment[]
+  /** neo-claw: who sent it (shared channels have several people). */
+  author?: UserPromptAuthor
   /**
    * Light the bubble — a jump just landed on this message.
    *
@@ -104,13 +106,19 @@ export function UserMessageAttachments({ attachments, align = "end" }: { attachm
  */
 export const USER_BUBBLE_CLASS = "min-w-0 rounded-2xl border border-border bg-muted text-primary prose prose-sm prose-invert"
 
-export function UserMessage({ content, attachments = [], flash = false }: Props) {
+export function UserMessage({ content, attachments = [], flash = false, author }: Props) {
   const parsedContent = useMemo(() => parseSystemMessage(content), [content])
   const bubbleRef = useRef<HTMLDivElement | null>(null)
 
   return (
     <>
       <div className="flex flex-col items-end gap-2">
+        {author ? (
+          <div className="-mb-1 text-xs text-muted-foreground" data-testid="user-prompt-author">
+            {author.name}
+            {author.via === "web" ? " · web" : author.via === "wake" ? "" : " · Discord"}
+          </div>
+        ) : null}
         <UserMessageAttachments attachments={attachments} />
         {(parsedContent.body || (!parsedContent.body && attachments.length === 0 && content && !parsedContent.systemMessage)) ? (
           // The flash is a class on the bubble, not a layer inside it: a
