@@ -1,23 +1,13 @@
-import { useMemo, useState } from "react"
+import { useState } from "react"
 import { Link, useSearchParams } from "react-router-dom"
 import { BookOpen, ChevronDown, ChevronRight, FileText, Plug, Settings2, Sparkles, Webhook } from "lucide-react"
 import { TranscriptMarkdown } from "../../components/messages/shared"
 import { cn } from "../../lib/utils"
-import { ncPost, useNc } from "../api"
+import { ncPost, useNc, type SkillTree } from "../api"
+import { SettingsEditor } from "../SettingsEditor"
+import { SkillTreeView } from "../SkillTree"
 import { Body, Empty, ErrorBox, Loading, Page, PageHeader, Panel, Pill, Row, Section, Tabs, useTab } from "../ui"
 
-interface LibSkill {
-  id: string
-  name: string
-  description: string
-  source: string
-  effect: string
-  spaceId: string | null
-  spaceName: string | null
-  channelId: string | null
-  channelName: string | null
-  channelCount: number
-}
 interface LibHook {
   event: string
   matcher: string
@@ -41,7 +31,7 @@ interface LibMcp {
   canList: boolean
 }
 interface LibraryView {
-  skills: LibSkill[]
+  skillTree: SkillTree
   remoteSkillHosts: string[]
   hooks: LibHook[]
   envKeys: string[]
@@ -56,26 +46,15 @@ const SOURCE_LABEL: Record<string, string> = {
   global: "Everywhere on this host",
   bundled: "Bundled with neo-claw",
   space: "Space skills",
-  channel: "Channel-only skills",
-}
-
-/** Hide the long synced-store prefix ("synced/<uuid>_<uuid>/name"). */
-function skillLabel(s: { name: string }) {
-  return s.name
+  channel: "Copy inside a chat",
 }
 
 export function LibraryPage() {
   const { data, error, reload } = useNc<LibraryView>("/library")
   const [tab, setTab] = useTab(TABS, "skills")
   const [q, setQ] = useState("")
-  const groups = useMemo(() => {
-    if (!data) return []
-    const needle = q.trim().toLowerCase()
-    const list = needle ? data.skills.filter((s) => `${s.name} ${s.description} ${s.spaceName ?? ""} ${s.channelName ?? ""}`.toLowerCase().includes(needle)) : data.skills
-    return ["space", "global", "bundled", "channel"]
-      .map((src) => ({ src, items: list.filter((s) => s.source === src).sort((a, b) => a.name.localeCompare(b.name)) }))
-      .filter((g) => g.items.length > 0)
-  }, [data, q])
+  const [showEmpty, setShowEmpty] = useState(false)
+  const counts = data?.skillTree.counts
 
   return (
     <Page>
@@ -84,7 +63,7 @@ export function LibraryPage() {
           value={tab}
           onChange={setTab}
           tabs={[
-            { id: "skills", label: "Skills", count: data?.skills.length },
+            { id: "skills", label: "Skills", count: counts?.rows },
             { id: "hooks", label: "Hooks", count: data?.hooks.length },
             { id: "mcp", label: "MCP", count: data?.mcp.length },
             { id: "settings", label: "Settings" },
@@ -105,28 +84,16 @@ export function LibraryPage() {
                   placeholder="Filter skills"
                   className="mb-4 h-10 w-full rounded-xl border border-border bg-card px-3 text-[14px] outline-none focus:border-foreground/30"
                 />
-                {groups.length === 0 ? <Empty>No skills match.</Empty> : null}
-                {groups.map((g) => (
-                  <Section key={g.src} title={`${SOURCE_LABEL[g.src] ?? g.src} · ${g.items.length}`}>
-                    <Panel>
-                      {g.items.map((s) => (
-                        <Row key={`${s.source}:${s.id}`} to={`/library/skill?source=${s.source}&id=${encodeURIComponent(s.id)}`}>
-                          <Sparkles className={cn("size-4 shrink-0", s.source === "space" ? "text-logo" : "text-muted-foreground")} />
-                          <div className="min-w-0 flex-1">
-                            <div className="flex min-w-0 items-center gap-2">
-                              <span className="truncate text-[13.5px] font-medium">{skillLabel(s)}</span>
-                              {s.spaceName ? <Pill>{s.spaceName}</Pill> : null}
-                              {s.channelName ? <Pill>#{s.channelName}</Pill> : null}
-                            </div>
-                            <div className="line-clamp-2 text-[12px] leading-snug text-muted-foreground">{s.description}</div>
-                            {s.source !== "global" ? <div className="mt-0.5 text-[11px] text-muted-foreground/80">{s.effect}</div> : null}
-                          </div>
-                        </Row>
-                      ))}
-                    </Panel>
-                  </Section>
-                ))}
-                {data.remoteSkillHosts.length ? <p className="px-1 text-[12px] text-muted-foreground">Skills on {data.remoteSkillHosts.join(", ")} live on that host and aren't listed here.</p> : null}
+                <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[12px] text-muted-foreground">
+                  <span>
+                    {counts!.rows} skills, each shown once · {counts!.copies} skill folders inside chats ({counts!.bundledCopies} bundled, {counts!.spaceCopies} from spaces, {counts!.retiredCopies} retired, {counts!.localCopies} chat-local)
+                  </span>
+                  <label className="ml-auto flex cursor-pointer items-center gap-1.5">
+                    <input type="checkbox" checked={showEmpty} onChange={(e) => setShowEmpty(e.target.checked)} className="size-3.5" />
+                    Show empty spaces and channels
+                  </label>
+                </div>
+                <SkillTreeView tree={data.skillTree} q={q} showEmpty={showEmpty} />
               </>
             ) : null}
 
@@ -156,18 +123,21 @@ export function LibraryPage() {
 
             {tab === "settings" ? (
               <>
-                <Section title="Channel defaults">
+                <Section title="Chat defaults (every chat without its own override)">
+                  <SettingsEditor scope="global" />
+                </Section>
+                <Section title="Claude Code">
                   <Panel>
                     {[
-                      ["Model", data.channelGlobal.model ?? "default"],
-                      ["Effort", data.channelGlobal.effort ?? "default"],
-                      ["Max turns", data.channelGlobal.maxTurns && data.channelGlobal.maxTurns !== "0" ? data.channelGlobal.maxTurns : "unlimited"],
-                      ["Auto-compact at", `${Math.round(data.compact.tokens / 1000)}k tokens`],
-                      ["Permission mode", data.permissions.defaultMode ?? "default"],
-                    ].map(([k, v]) => (
+                      ["Auto-compact at", `${Math.round(data.compact.tokens / 1000)}k tokens`, data.compact.from],
+                      ["Permission mode", data.permissions.defaultMode ?? "default", "Claude Code settings.json"],
+                    ].map(([k, v, from]) => (
                       <Row key={k}>
                         <span className="flex-1 text-[13.5px] text-muted-foreground">{k}</span>
-                        <span className="text-[13.5px] font-medium">{v}</span>
+                        <span className="text-right">
+                          <span className="block text-[13.5px] font-medium">{v}</span>
+                          <span className="block text-[11px] text-muted-foreground">{from}</span>
+                        </span>
                       </Row>
                     ))}
                   </Panel>
@@ -288,7 +258,7 @@ interface SkillView {
   spaceName: string | null
   channelName: string | null
   channels: { id: string; name: string }[]
-  files: string[]
+  files: { rel: string; size: number; dir: boolean }[]
   truncatedTree: boolean
   file: string
   text: string | null
@@ -332,11 +302,11 @@ export function SkillPage() {
                 ))}
               </div>
             ) : null}
-            {data.files.length > 1 ? (
+            {data.files.filter((f) => !f.dir && !f.rel.startsWith(".")).length > 1 ? (
               <div className="-mx-1 mb-3 flex gap-1.5 overflow-x-auto px-1 pb-1">
-                {data.files.map((f) => (
-                  <button key={f} type="button" onClick={() => pick(f)} className={cn("flex shrink-0 items-center gap-1 rounded-full border border-border px-2.5 py-1 font-mono text-[11.5px]", f === data.file ? "bg-foreground text-background" : "hover:bg-muted")}>
-                    <FileText className="size-3" /> {f}
+                {data.files.filter((f) => !f.dir && !f.rel.startsWith(".")).map((f) => (
+                  <button key={f.rel} type="button" onClick={() => pick(f.rel)} className={cn("flex shrink-0 items-center gap-1 rounded-full border border-border px-2.5 py-1 font-mono text-[11.5px]", f.rel === data.file ? "bg-foreground text-background" : "hover:bg-muted")}>
+                    <FileText className="size-3" /> {f.rel}
                   </button>
                 ))}
               </div>

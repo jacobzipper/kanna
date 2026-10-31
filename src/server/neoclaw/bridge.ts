@@ -641,6 +641,17 @@ export class NeoClawBridge {
     }
   }
 
+  /** GET with the HTTP status, so callers can tell "endpoint missing" (404) from "API down" (status 0). */
+  async apiGetStatus<T>(pathname: string, timeoutMs = 4000): Promise<{ status: number; body: T | null }> {
+    try {
+      const res = await this.api(pathname, { signal: AbortSignal.timeout(timeoutMs) })
+      const body = res.ok ? ((await res.json().catch(() => null)) as T | null) : null
+      return { status: res.status, body }
+    } catch {
+      return { status: 0, body: null }
+    }
+  }
+
   /** /space init | off through neo-claw. Returns the API's JSON or throws with its error. */
   async spaceAction(action: "init" | "off", body: Record<string, unknown>, user: SessionUser, mirror: boolean) {
     let res: Response

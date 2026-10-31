@@ -396,6 +396,8 @@ async function spaceView(ctx: AppContext, categoryId: string) {
     notes: notes ? { text: maskSecrets(notes.text), hash: notes.hash, exists: notes.exists } : null,
     history,
     skills,
+    mcp: await ctx.stack.spaceMcp(categoryId),
+    notesLimit: 14_000,
     members: await Promise.all(members.map((m) => card(ctx, m))),
     compactWindow: settings.compact.tokens,
     memory: memory
@@ -464,22 +466,11 @@ async function memoryFile(ctx: AppContext, channelId: string, file: string) {
 }
 
 async function library(ctx: AppContext) {
-  const [skills, settings, mcp] = await Promise.all([ctx.stack.skills(), ctx.stack.settings(), ctx.stack.mcpServers()])
+  const [settings, mcp] = await Promise.all([ctx.stack.settings(), ctx.stack.mcpServers()])
   const tree = await buildTree(ctx)
   const name = (id: string) => findChannel(tree, id)?.name ?? null
   return {
-    skills: skills.map((k) => ({
-      id: k.id,
-      name: k.name,
-      description: k.description,
-      source: k.source,
-      effect: k.effect,
-      spaceId: k.spaceId ?? null,
-      spaceName: k.spaceName ?? null,
-      channelId: k.channelId ?? null,
-      channelName: k.channelId ? name(k.channelId) : null,
-      channelCount: k.channels.length,
-    })),
+    skillTree: await ctx.stack.skillTree(),
     remoteSkillHosts: ctx.stack.remoteSkillHosts(),
     hooks: settings.hooks,
     envKeys: settings.envKeys,
@@ -488,6 +479,38 @@ async function library(ctx: AppContext) {
     channelGlobal: settings.channelGlobal,
     // `sample` holds the launch env: never sent.
     mcp: mcp.map(({ sample: _s, ...m }) => ({ ...m, channelNames: m.channels.slice(0, 40).map((id) => name(id) ?? "unnamed"), canList: Boolean(_s) })),
+  }
+}
+
+const SETTINGS_KEYS = ["model", "effort", "maxTurns", "progressCard", "voiceMode", "slashPassthrough", "workflows", "tables"]
+const SETTINGS_PENDING = "Editing needs the neo-claw settings API (queued deploy)."
+
+type SettingsMap = Record<string, unknown>
+
+/**
+ * Per-chat settings. Live from neo-claw's /api/settings when the bot has it;
+ * otherwise read from .settings.json and marked read-only (Kanna never writes
+ * that file: the bot holds it in memory and would overwrite it).
+ */
+async function settingsView(ctx: AppContext) {
+  const fallbacks = await ctx.stack.settingsFallbacks()
+  const live = await ctx.bridge.apiGetStatus<{ global: SettingsMap; channels: Record<string, SettingsMap>; keys?: string[]; effortLevels?: string[]; tableModes?: string[] }>("/api/settings")
+  const base = {
+    keys: SETTINGS_KEYS,
+    effortLevels: ["low", "medium", "high", "xhigh", "max"],
+    tableModes: ["auto", "image", "text"],
+    fallbacks,
+  }
+  if (live.status === 200 && live.body) {
+    return { ...base, ...{ keys: live.body.keys ?? base.keys, effortLevels: live.body.effortLevels ?? base.effortLevels, tableModes: live.body.tableModes ?? base.tableModes }, global: live.body.global ?? {}, channels: live.body.channels ?? {}, editable: true, reason: null }
+  }
+  const file = await ctx.stack.settingsFile()
+  return {
+    ...base,
+    global: file.global,
+    channels: file.channels,
+    editable: false,
+    reason: live.status === 0 ? "neo-claw's web API isn't reachable right now, so settings are read-only (from .settings.json)." : SETTINGS_PENDING,
   }
 }
 
@@ -583,6 +606,7 @@ export async function handleAppApi(req: Request, url: URL, ctx: AppContext): Pro
       if (p === "/home") return json(await home(ctx))
       if (p === "/library") return json(await library(ctx))
       if (p === "/infra") return json(await infra(ctx))
+      if (p === "/settings") return json(await settingsView(ctx))
       if (p === "/skill") {
         const v = await skillView(ctx, str(url.searchParams.get("source"), 20), str(url.searchParams.get("id"), 400), url.searchParams.get("file"))
         return v ? json(v) : err(404, "no such skill")
@@ -724,6 +748,17 @@ export async function handleAppApi(req: Request, url: URL, ctx: AppContext): Pro
         const now = await ctx.stack.spaceNotes(categoryId)
         return json({ ok: true, changed: r.changed, backup: r.backup ? path.basename(r.backup) : null, hash: now?.hash ?? null, rows: r.changed ? diffRows(r.before, now?.text ?? "") : [] })
       }
+      if (parts[2] === "config") {
+        const mc = str(b.missionControlChannelId, 30)
+        if (!mc) return err(400, "nothing to change")
+        try {
+          const r = await ctx.stack.saveSpaceConfig(categoryId, { missionControlChannelId: mc }, `${ctx.user.username} (${ctx.user.discordId})`)
+          forget("app:")
+          return json(r)
+        } catch (e) {
+          return err(400, e instanceof Error ? e.message : String(e))
+        }
+      }
       if (parts[2] === "action") {
         const action = str(b.action, 20)
         if (action === "backfill") {
@@ -738,10 +773,10 @@ export async function handleAppApi(req: Request, url: URL, ctx: AppContext): Pro
           if (action === "init") {
             const mode = str(b.mode, 20)
             const ch = str(b.channelId, 30)
-            if (mode === "this" && isSnowflake(ch)) {
-              delete payload.categoryId
+            // neo-claw expects "this-channel" (mission control = that channel) or "create".
+            if ((mode === "this" || mode === "this-channel") && isSnowflake(ch)) {
               payload.channelId = ch
-              payload.mode = "this"
+              payload.mode = "this-channel"
             } else payload.mode = "create"
           }
           const r = await ctx.bridge.spaceAction(action, payload, ctx.user, mirror)
@@ -749,6 +784,31 @@ export async function handleAppApi(req: Request, url: URL, ctx: AppContext): Pro
           return json({ ok: true, result: r })
         }
         return err(400, "unknown action")
+      }
+    }
+    if (p === "/settings" || p === "/settings/reset") {
+      const scope = b.scope === "channel" ? "channel" : b.scope === "global" ? "global" : null
+      const channelId = str(b.channelId, 30)
+      if (!scope) return err(400, "scope must be global or channel")
+      if (scope === "channel" && !isSnowflake(channelId)) return err(400, "bad channel")
+      const payload: Record<string, unknown> = { scope, discordUserId: ctx.user.discordId, displayName: ctx.user.displayName }
+      if (scope === "channel") payload.channelId = channelId
+      if (p === "/settings") {
+        const key = str(b.key, 40)
+        if (!SETTINGS_KEYS.includes(key)) return err(400, "unknown setting")
+        payload.key = key
+        payload.value = b.value === undefined ? null : b.value
+      }
+      try {
+        const r = await ctx.bridge.apiPost(p === "/settings" ? "/api/settings" : "/api/settings/reset", payload, 15_000)
+        forget("app:")
+        forget("settings")
+        console.log(`[neoclaw] settings ${p === "/settings" ? `${String(payload.key)}=${JSON.stringify(payload.value)}` : "reset"} (${scope}${scope === "channel" ? ` ${channelId}` : ""}) by ${ctx.user.username}`)
+        return json(r)
+      } catch (e) {
+        const status = (e as { status?: number }).status
+        if (status === 404) return err(503, SETTINGS_PENDING)
+        return err(status && status >= 400 && status < 500 ? status : 502, e instanceof Error ? e.message : String(e))
       }
     }
     if (parts[0] === "mcp" && parts[1] && parts[2] === "tools") {

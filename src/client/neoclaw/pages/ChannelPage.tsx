@@ -8,6 +8,7 @@ import { Composer } from "../Composer"
 import { NewConversationDialog } from "../dialogs"
 import { bytes, mentions, oneLine, timeAgo } from "../format"
 import { RunList } from "../RunList"
+import { SettingsEditor } from "../SettingsEditor"
 import { Body, ContextBar, Empty, ErrorBox, Loading, Notice, Page, PageHeader, Panel, Pill, Row, Section, StatusDot, Tabs, useNow, useTab } from "../ui"
 
 const TABS = ["conversations", "traces", "memory", "skills", "settings"] as const
@@ -218,7 +219,7 @@ export function ChannelPage() {
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
                             <span className="truncate text-[13.5px] font-medium">{s.name}</span>
-                            <Pill>{s.source === "space" ? s.spaceName ?? "space" : s.source}</Pill>
+                            <Pill>{s.source === "space" ? s.spaceName ?? "space" : s.source === "channel" ? "this chat" : s.source}</Pill>
                           </div>
                           <div className="line-clamp-1 text-[12px] text-muted-foreground">{s.description}</div>
                         </div>
@@ -242,23 +243,20 @@ export function ChannelPage() {
 
             {tab === "settings" ? (
               <>
-                <Panel>
-                  {[
-                    ["Model", data.settings.model ?? "default"],
-                    ["Effort", data.settings.effort ?? "default"],
-                    ["Max turns", data.settings.maxTurns && data.settings.maxTurns !== "0" ? data.settings.maxTurns : "unlimited"],
-                    ["Auto-compact at", `${(data.compactWindow / 1000).toFixed(0)}k tokens`],
-                    ["Runs on", data.remoteHost ?? "this server"],
-                  ].map(([k, v]) => (
-                    <Row key={k}>
-                      <span className="flex-1 text-[13.5px] text-muted-foreground">{k}</span>
-                      <span className="text-[13.5px] font-medium">{v}</span>
-                    </Row>
-                  ))}
-                </Panel>
-                <p className="mt-2 px-1 text-[12px] text-muted-foreground">
-                  {data.settingsScope === "channel" ? "This channel overrides the defaults." : "Using the global defaults."} Change them in Discord with /model, /effort and /settings.
-                </p>
+                <SettingsEditor scope="channel" channelId={channelId} />
+                <Section title="Also" className="mt-6">
+                  <Panel>
+                    {[
+                      ["Auto-compact at", `${(data.compactWindow / 1000).toFixed(0)}k tokens`],
+                      ["Runs on", data.remoteHost ?? "this server"],
+                    ].map(([k, v]) => (
+                      <Row key={k}>
+                        <span className="flex-1 text-[13.5px] text-muted-foreground">{k}</span>
+                        <span className="text-[13.5px] font-medium">{v}</span>
+                      </Row>
+                    ))}
+                  </Panel>
+                </Section>
               </>
             ) : null}
           </>

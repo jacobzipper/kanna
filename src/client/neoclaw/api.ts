@@ -301,11 +301,86 @@ export interface SpaceView {
   notes: { text: string; hash: string; exists: boolean } | null
   history: string[]
   skills: { id: string; name: string; description: string }[]
+  mcp: SpaceMcpServer[]
+  notesLimit: number
   members: ChannelCard[]
   compactWindow: number
   memory: { channelId: string; index: string | null; summary: string | null; files: string[]; archive: Record<string, unknown> | null } | null
   activity: RunSummary[]
   apiReachable: boolean
+}
+
+export interface SpaceMcpServer {
+  name: string
+  type: string
+  command: string
+  args: string[]
+  /** Keys only: values come back masked. */
+  env: Record<string, string>
+  headers: Record<string, string>
+}
+
+// ------------------------------------------------------------------ settings
+
+export type SettingValue = string | number | boolean | null | undefined
+export type SettingsMap = Record<string, SettingValue>
+
+export interface SettingsView {
+  keys: string[]
+  effortLevels: string[]
+  tableModes: string[]
+  /** What a key falls back to when neither the chat nor the global default sets it. */
+  fallbacks: Record<string, string>
+  global: SettingsMap
+  channels: Record<string, SettingsMap>
+  editable: boolean
+  reason: string | null
+}
+
+// ------------------------------------------------------------------ skill tree
+
+export interface ChanRef {
+  id: string
+  name: string
+}
+export interface SkillLink {
+  source: "global" | "bundled" | "space" | "channel"
+  id: string
+}
+export interface LocalSkill {
+  name: string
+  description: string
+  link: SkillLink
+  hash: string | null
+  shadows: string | null
+  variant: { index: number; of: number } | null
+  holders: ChanRef[]
+}
+export interface ChannelSkills {
+  id: string
+  name: string
+  remoteHost: string | null
+  isMission: boolean
+  skills: LocalSkill[]
+}
+export interface SpaceSkills {
+  id: string
+  name: string
+  enabled: boolean
+  skills: { name: string; description: string; link: SkillLink; copies: number }[]
+  shared: LocalSkill[]
+  channels: ChannelSkills[]
+}
+export interface SkillTree {
+  global: { name: string; description: string; link: SkillLink; synced: boolean }[]
+  localChats: number
+  bundled: { name: string; description: string; link: SkillLink; defaultOn: boolean; holders: ChanRef[]; edited: number }[]
+  retired: { name: string; description: string; link: SkillLink; holders: ChanRef[] }[]
+  spaces: SpaceSkills[]
+  noSpace: ChannelSkills[]
+  shared: LocalSkill[]
+  remoteSkillHosts: string[]
+  counts: { rows: number; copies: number; bundledCopies: number; retiredCopies: number; spaceCopies: number; localCopies: number }
 }
 
 export interface HomeView {

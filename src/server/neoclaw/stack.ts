@@ -6,6 +6,7 @@ import path from "node:path"
 import type { LoadedNeoClawConfig } from "./config"
 import type { NeoClawBridge } from "./bridge"
 import { mcpRequest, type StdioServer } from "./mcp-client"
+import { buildSkillTree, type InvChat, type InvCopy, type InvSpace, type SkillInventory, type SkillTree } from "./skill-tree"
 
 /**
  * Read-only views of the neo-claw stack (skills, memory, hooks, MCP servers,
@@ -221,75 +222,205 @@ export class Stack {
     return { ok: true as const, changed: true, backup, before: current.text }
   }
 
+  /** The space's mcp.json, read-only: server shapes with env and header values masked. */
+  async spaceMcp(categoryId: string) {
+    if (!isSnowflake(categoryId)) return []
+    const m = await readJson<{ mcpServers?: Record<string, Record<string, unknown>> }>(path.join(this.spaceDir(categoryId), "mcp.json"))
+    const mask = (o: unknown) => Object.fromEntries(Object.keys((o as Record<string, unknown>) ?? {}).map((k) => [k, "••••"]))
+    return Object.entries(m?.mcpServers ?? {}).map(([name, def]) => ({
+      name,
+      type: typeof def.type === "string" ? def.type : def.url ? "http" : "stdio",
+      command: maskSecrets(String(def.command ?? def.url ?? "")),
+      args: Array.isArray(def.args) ? (def.args as unknown[]).map((a) => maskSecrets(String(a))) : [],
+      env: mask(def.env),
+      headers: mask(def.headers),
+    }))
+  }
+
+  /**
+   * Change a space's index entry (mission control). neo-claw re-reads
+   * .spaces/index.json on every use and writes it with tmp + rename, so an
+   * atomic write here is picked up without a restart. Logged to the space's
+   * .history/config.log.
+   */
+  async saveSpaceConfig(categoryId: string, change: { missionControlChannelId?: string }, who: string) {
+    if (!isSnowflake(categoryId)) throw new Error("bad space id")
+    const file = path.join(this.config.contextDir, ".spaces", "index.json")
+    const index = await readJson<{ spaces?: Record<string, Record<string, unknown>>; channels?: Record<string, { categoryId?: string | null }> }>(file)
+    const space = index?.spaces?.[categoryId]
+    if (!index || !space) throw new Error("this category isn't a space yet; turn it on first")
+    const changes: string[] = []
+    if (change.missionControlChannelId !== undefined) {
+      const mc = change.missionControlChannelId
+      if (!isSnowflake(mc)) throw new Error("bad channel id")
+      const member = index.channels?.[mc]?.categoryId === categoryId || this.bridge.placement(mc).categoryId === categoryId
+      if (!member) throw new Error("mission control must be a channel in this space")
+      if (space.missionControlChannelId !== mc) {
+        changes.push(`missionControlChannelId ${String(space.missionControlChannelId ?? "none")} -> ${mc}`)
+        space.missionControlChannelId = mc
+      }
+    }
+    if (!changes.length) return { ok: true as const, changed: false }
+    const tmp = `${file}.kanna.${process.pid}.${Date.now()}.tmp`
+    await writeFile(tmp, JSON.stringify(index, null, 2), { mode: 0o644 })
+    await rename(tmp, file)
+    const hist = path.join(this.spaceDir(categoryId), ".history")
+    await mkdir(hist, { recursive: true }).catch(() => {})
+    const line = `${new Date().toISOString()} ${who} via Kanna: ${changes.join("; ")}\n`
+    await writeFile(path.join(hist, "config.log"), line, { flag: "a", mode: 0o644 }).catch(() => {})
+    console.log(`[neoclaw] space ${categoryId} config: ${who}: ${changes.join("; ")}`)
+    await this.bridge.refreshSpaceIndex(0)
+    forget("skills")
+    return { ok: true as const, changed: true, changes }
+  }
+
+  /** Per-chat settings straight from .settings.json (read-only; the bot owns this file). */
+  async settingsFile() {
+    const raw = (await readJson<{ global?: Record<string, unknown>; channels?: Record<string, Record<string, unknown>> }>(path.join(this.config.contextDir, ".settings.json"))) ?? {}
+    return { global: raw.global ?? {}, channels: raw.channels ?? {} }
+  }
+
+  /** What each key falls back to when neither the chat nor the global default sets it. */
+  async settingsFallbacks(): Promise<Record<string, string>> {
+    const nc = await this.neoClawConfig()
+    const maxTurns = typeof nc?.maxTurns === "number" && nc.maxTurns ? nc.maxTurns : 50
+    return {
+      model: typeof nc?.model === "string" ? `${nc.model} (neo-claw config)` : "Claude Code default",
+      effort: typeof nc?.effort === "string" ? `${nc.effort} (neo-claw config)` : "Claude Code default",
+      maxTurns: `${maxTurns} (neo-claw config)`,
+      progressCard: typeof nc?.progressCardEnabled === "boolean" ? `${nc.progressCardEnabled ? "on" : "off"} (neo-claw config)` : "on (neo-claw default)",
+      voiceMode: "off",
+      slashPassthrough: "on",
+      workflows: "off",
+      tables: "auto",
+    }
+  }
+
   // ---------------------------------------------------------------- skills
 
-  /** Every skill on the box, by source, with where it's in effect. */
+  /** What's on disk: global, bundled and space skills, and every skill folder inside each chat. */
+  async skillInventory(): Promise<SkillInventory> {
+    return cached("skills:inv", 60_000, async () => {
+      const index = await this.bridge.refreshSpaceIndex()
+      const nc = await this.neoClawConfig()
+      const root = this.config.neoClawRoot
+      const dirIds = (await readdir(this.config.contextDir).catch(() => [] as string[])).filter(isSnowflake)
+      const ids = [...new Set([...dirIds, ...Object.keys(index.channels).filter(isSnowflake)])]
+      const chats: InvChat[] = []
+      for (const id of ids) {
+        const skillsDir = path.join(this.channelDir(id), ".claude", "skills")
+        const entries = await readdir(skillsDir, { withFileTypes: true }).catch(() => [])
+        const copies: InvCopy[] = []
+        for (const d of entries) {
+          if (!d.isDirectory() || d.name.startsWith(".")) continue
+          const dir = path.join(skillsDir, d.name)
+          const meta = await skillMeta(dir)
+          const marker = (await readText(path.join(dir, ".installed-sha256"), 256))?.text.trim() ?? null
+          copies.push({ name: d.name, description: meta.description, hash: meta.hash, marker })
+        }
+        chats.push({
+          id,
+          name: this.bridge.channelName(id),
+          remoteHost: this.bridge.isRemote(id),
+          categoryId: this.bridge.placement(id).categoryId ?? index.channels[id]?.categoryId ?? null,
+          copies,
+          spaceManaged: await readJson<string[]>(path.join(skillsDir, ".space-managed.json")),
+          bundledManaged: await readJson<string[]>(path.join(skillsDir, ".bundled-managed.json")),
+        })
+      }
+      const spaces: InvSpace[] = []
+      for (const [catId, sp] of Object.entries(index.spaces)) {
+        spaces.push({ id: catId, name: sp.name, enabled: Boolean(sp.enabled), missionControlChannelId: sp.missionControlChannelId ?? null, skills: await findSkills(path.join(this.spaceDir(catId), "skills")) })
+      }
+      return {
+        global: await findSkills(this.config.globalSkillsDir ?? ""),
+        bundled: root ? await findSkills(path.join(root, "skills")) : [],
+        defaultOn: Array.isArray(nc?.enabledSkills) ? (nc!.enabledSkills as string[]).filter((x) => typeof x === "string") : [],
+        shippedHashes: (root ? await readJson<Record<string, unknown>>(path.join(root, "skills", ".shipped-hashes.json")) : null) as Record<string, string[]> ?? {},
+        spaces,
+        chats,
+        remoteSkillHosts: this.remoteSkillHosts(),
+      }
+    })
+  }
+
+  /** Library tree: each skill once, at the level it comes from (see skill-tree.ts). */
+  async skillTree(): Promise<SkillTree> {
+    return cached("skills:tree", 60_000, async () => buildSkillTree(await this.skillInventory()))
+  }
+
+  /** Every skill on the box as a flat list, with the chats it's in effect in. */
   async skills(): Promise<SkillEntry[]> {
     return cached("skills", 60_000, async () => {
+      const inv = await this.skillInventory()
+      const tree = await this.skillTree()
+      const ids = (refs: { id: string }[]) => refs.map((r) => r.id)
       const out: SkillEntry[] = []
-      const index = this.bridge.getSpaceIndex()
-      const nc = await this.neoClawConfig()
-      const enabled = new Set(Array.isArray(nc?.enabledSkills) ? (nc!.enabledSkills as string[]) : [])
-      const channels = (await readdir(this.config.contextDir).catch(() => [] as string[])).filter(isSnowflake)
-      const localChannels = channels.filter((id) => !this.bridge.isRemote(id))
-
-      // Copies inside each channel: bundled copies, space copies, and channel-local skills.
-      const copies = new Map<string, { channelId: string; spaceManaged: boolean }[]>()
-      for (const id of channels) {
-        const root = path.join(this.channelDir(id), ".claude", "skills")
-        const names = await readdir(root, { withFileTypes: true }).catch(() => [])
-        if (names.length === 0) continue
-        const managed = new Set((await readJson<string[]>(path.join(root, ".space-managed.json"))) ?? [])
-        for (const d of names) {
-          if (!d.isDirectory() || d.name.startsWith(".")) continue
-          const list = copies.get(d.name) ?? []
-          list.push({ channelId: id, spaceManaged: managed.has(d.name) })
-          copies.set(d.name, list)
-        }
+      const localChats = inv.chats.filter((c) => !c.remoteHost).length
+      for (const s of inv.global) {
+        out.push({ ...s, dir: path.join(this.config.globalSkillsDir ?? "", s.id), source: "global", effect: `every chat on this host (${localChats} local chats)`, channels: [] })
       }
-
-      for (const s of await findSkills(this.config.globalSkillsDir ?? "")) {
-        out.push({ ...s, source: "global", effect: `every chat on this host (${localChannels.length} local chats)`, channels: [] })
+      for (const b of tree.bundled) {
+        const s = inv.bundled.find((x) => x.id === b.link.id)!
+        out.push({
+          ...s,
+          dir: path.join(this.config.neoClawRoot ?? "", "skills", s.id),
+          source: "bundled",
+          effect: `${b.defaultOn ? "enabled by default (enabledSkills); " : "opt-in; "}copied into ${b.holders.length} chat${b.holders.length === 1 ? "" : "s"}${b.edited ? ` (+${b.edited} edited cop${b.edited === 1 ? "y" : "ies"})` : ""}`,
+          channels: ids(b.holders),
+        })
       }
-      const bundledNames = new Set<string>()
-      if (this.config.neoClawRoot) {
-        for (const s of await findSkills(path.join(this.config.neoClawRoot, "skills"))) {
-          bundledNames.add(s.name)
-          const holders = (copies.get(s.name) ?? []).filter((c) => !c.spaceManaged).map((c) => c.channelId)
-          const always = s.name === "skill-author" || enabled.has(s.name)
+      for (const sp of inv.spaces) {
+        const members = inv.chats.filter((c) => c.categoryId === sp.id).map((c) => c.id)
+        for (const s of sp.skills) {
           out.push({
             ...s,
-            source: "bundled",
-            effect: `${always ? "enabled by default (enabledSkills); " : "opt-in; "}copied into ${holders.length} chat${holders.length === 1 ? "" : "s"}`,
-            channels: holders,
-          })
-        }
-      }
-      for (const [catId, space] of Object.entries(index.spaces)) {
-        for (const s of await findSkills(path.join(this.spaceDir(catId), "skills"))) {
-          const members = Object.entries(index.channels).filter(([, c]) => c.categoryId === catId).map(([id]) => id)
-          out.push({
-            ...s,
+            dir: path.join(this.spaceDir(sp.id), "skills", s.id),
             source: "space",
-            spaceId: catId,
-            spaceName: space.name,
-            effect: space.enabled ? `member chats of space ${space.name} (${members.length})` : `space ${space.name} is off: not in effect`,
-            channels: space.enabled ? members : [],
+            spaceId: sp.id,
+            spaceName: sp.name,
+            effect: sp.enabled ? `member chats of space ${sp.name} (${members.length})` : `space ${sp.name} is off: not in effect`,
+            channels: sp.enabled ? members : [],
           })
         }
       }
-      for (const [name, list] of copies) {
-        for (const c of list) {
-          if (c.spaceManaged || bundledNames.has(name)) continue
-          const dir = path.join(this.channelDir(c.channelId), ".claude", "skills", name)
-          const meta = await skillMeta(dir)
-          out.push({ id: `${c.channelId}/${name}`, name, description: meta.description, dir, source: "channel", channelId: c.channelId, effect: "this chat only", channels: [c.channelId] })
+      // Chat copies that aren't bundled or space-managed, plus retired bundled leftovers.
+      const localRows = [
+        ...tree.shared,
+        ...tree.spaces.flatMap((s) => [...s.shared, ...s.channels.flatMap((c) => c.skills)]),
+        ...tree.noSpace.flatMap((c) => c.skills),
+      ]
+      for (const r of localRows) {
+        for (const h of r.holders) {
+          out.push({
+            id: `${h.id}/${r.name}`,
+            name: r.name,
+            description: r.description,
+            dir: path.join(this.channelDir(h.id), ".claude", "skills", r.name),
+            source: "channel",
+            channelId: h.id,
+            effect: r.shadows ? `this chat only (local copy, shadows ${r.shadows})` : "this chat only",
+            channels: [h.id],
+          })
+        }
+      }
+      for (const r of tree.retired) {
+        for (const h of r.holders) {
+          out.push({
+            id: `${h.id}/${r.name}`,
+            name: r.name,
+            description: r.description,
+            dir: path.join(this.channelDir(h.id), ".claude", "skills", r.name),
+            source: "channel",
+            channelId: h.id,
+            effect: "left over from a bundled skill neo-claw no longer ships; pruned the next time this chat runs",
+            channels: [h.id],
+          })
         }
       }
       return out
     })
   }
-
   /** Skills on remote hosts aren't readable from here. */
   remoteSkillHosts(): string[] {
     return [...new Set(Object.values(this.config.remoteRouting))]
@@ -297,7 +428,15 @@ export class Stack {
 
   async skill(source: string, id: string) {
     const all = await this.skills()
-    return all.find((s) => s.source === source && s.id === id) ?? null
+    const hit = all.find((s) => s.source === source && s.id === id)
+    if (hit || source !== "channel") return hit ?? null
+    // Any skill folder inside a chat (e.g. a bundled or space copy) has a page too.
+    const m = /^(\d{5,25})\/([\w.-]{1,100})$/.exec(id)
+    if (!m) return null
+    const dir = await resolveInside(path.join(this.channelDir(m[1]!), ".claude", "skills"), m[2]!)
+    if (!dir || !(await safeStat(path.join(dir, "SKILL.md")))?.isFile()) return null
+    const meta = await skillMeta(dir)
+    return { id, name: meta.name || m[2]!, description: meta.description, dir, source: "channel", channelId: m[1]!, effect: "a copy inside this chat", channels: [m[1]!] } satisfies SkillEntry
   }
 
   // ---------------------------------------------------------------- memory
@@ -737,19 +876,21 @@ function describeScript(src: string) {
 }
 
 async function skillMeta(dir: string) {
-  const r = await readText(path.join(dir, "SKILL.md"), 16 * 1024)
+  const r = await readText(path.join(dir, "SKILL.md"), 1024 * 1024)
   const fm = r ? /^---\n([\s\S]*?)\n---/.exec(r.text)?.[1] ?? "" : ""
   const name = /^name:\s*(.+)$/m.exec(fm)?.[1]?.trim().replace(/^["']|["']$/g, "")
   const raw = /^description:\s*(.+)$/m.exec(fm)?.[1]?.trim() ?? ""
   // Unquote YAML scalars: "…" keeps \" escapes, '…' doubles single quotes.
   const description = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1).replace(/\\(["\\])/g, "$1") : raw.startsWith("'") && raw.endsWith("'") ? raw.slice(1, -1).replace(/''/g, "'") : raw
-  return { name, description, hasSkillMd: Boolean(r) }
+  // Full sha256, comparable with neo-claw's .installed-sha256 and shipped hashes.
+  const hash = r && !r.truncated ? createHash("sha256").update(r.text, "utf8").digest("hex") : null
+  return { name, description, hasSkillMd: Boolean(r), hash }
 }
 
 /** Skill folders (holding SKILL.md) up to three levels under `root`. */
-async function findSkills(root: string): Promise<{ id: string; name: string; description: string; dir: string }[]> {
+async function findSkills(root: string): Promise<{ id: string; name: string; description: string; dir: string; hash: string | null }[]> {
   if (!root) return []
-  const out: { id: string; name: string; description: string; dir: string }[] = []
+  const out: { id: string; name: string; description: string; dir: string; hash: string | null }[] = []
   const walk = async (dir: string, depth: number) => {
     const entries = await readdir(dir, { withFileTypes: true }).catch(() => [])
     for (const e of entries) {
@@ -758,7 +899,7 @@ async function findSkills(root: string): Promise<{ id: string; name: string; des
       const meta = await skillMeta(sub)
       if (meta.hasSkillMd) {
         const id = path.relative(root, sub)
-        out.push({ id, name: meta.name || e.name, description: meta.description, dir: sub })
+        out.push({ id, name: meta.name || e.name, description: meta.description, dir: sub, hash: meta.hash })
       } else if (depth < 3) {
         await walk(sub, depth + 1)
       }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 import { Link, useNavigate, useParams } from "react-router-dom"
-import { History, LayoutGrid, MessageSquare, Orbit, Pencil, Plus, Sparkles } from "lucide-react"
+import { History, LayoutGrid, MessageSquare, Orbit, Pencil, Plug, Plus, Sparkles } from "lucide-react"
 import { TranscriptMarkdown } from "../../components/messages/shared"
 import { cn } from "../../lib/utils"
 import { invalidateNc, ncPost, NcError, useNc, type SpaceView } from "../api"
@@ -8,9 +8,9 @@ import { Composer } from "../Composer"
 import { NewChannelDialog } from "../dialogs"
 import { oneLine, timeAgo } from "../format"
 import { ChannelCardView, RunList } from "../RunList"
-import { Body, Empty, ErrorBox, Loading, Notice, Page, PageHeader, Panel, Row, Section, Tabs, useNow, useTab } from "../ui"
+import { Body, Empty, ErrorBox, Loading, Notice, Page, PageHeader, Panel, Pill, Row, Section, Tabs, useNow, useTab } from "../ui"
 
-const TABS = ["overview", "channels", "skills", "memory", "activity"] as const
+const TABS = ["overview", "channels", "skills", "memory", "activity", "settings"] as const
 type Tab = (typeof TABS)[number]
 
 export function SpacePage() {
@@ -43,6 +43,7 @@ export function SpacePage() {
             { id: "skills", label: "Skills", count: data?.skills.length },
             { id: "memory", label: "Memory" },
             { id: "activity", label: "Activity" },
+            { id: "settings", label: "Settings" },
           ]}
         />
       </PageHeader>
@@ -128,6 +129,12 @@ export function SpacePage() {
               )
             ) : null}
             {tab === "activity" ? <RunList runs={data.activity} showChannel now={now} empty="No runs in this space yet." /> : null}
+            {tab === "settings" ? (
+              <>
+                <SpaceConfig space={data} onSaved={reload} />
+                <SpaceMcp space={data} />
+              </>
+            ) : null}
           </>
         )}
       </Body>
@@ -205,7 +212,8 @@ function SpaceNotes({ space, onSaved }: { space: SpaceView; onSaved: () => void 
       {editing ? (
         <Panel>
           <textarea value={text} onChange={(e) => setText(e.target.value)} className="block min-h-[50vh] w-full resize-y bg-transparent p-4 font-mono text-[13px] leading-relaxed outline-none" spellCheck={false} />
-          <div className="flex justify-end gap-2 border-t border-border p-2">
+          <div className="flex items-center justify-end gap-2 border-t border-border p-2">
+            <CharCount n={text.length} limit={space.notesLimit} className="mr-auto pl-2" />
             <button type="button" className="h-9 rounded-full px-4 text-sm text-muted-foreground hover:bg-muted" onClick={() => setEditing(false)}>
               Cancel
             </button>
@@ -234,6 +242,7 @@ function SpaceNotes({ space, onSaved }: { space: SpaceView; onSaved: () => void 
           )}
         </Panel>
       )}
+      {!editing && space.notes?.text ? <CharCount n={space.notes.text.length} limit={space.notesLimit} className="mt-1.5 block px-1" /> : null}
       {space.history.length > 0 && !editing ? (
         <details className="mt-2 px-1 text-xs text-muted-foreground">
           <summary className="flex cursor-pointer items-center gap-1 py-1">
@@ -301,6 +310,132 @@ function SpaceActions({ space }: { space: SpaceView }) {
         </Row>
       </Panel>
       {err ? <div className="mt-2 rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-600">{err}</div> : null}
+    </Section>
+  )
+}
+
+/** "8,412 / 14,000": neo-claw cuts SPACE.md off at the limit when it builds the prompt. */
+function CharCount({ n, limit, className }: { n: number; limit: number; className?: string }) {
+  const over = n > limit
+  const near = !over && n > limit * 0.9
+  return (
+    <span
+      className={cn("text-[11.5px] tabular-nums", over ? "font-medium text-red-600 dark:text-red-400" : near ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground", className)}
+      title={`neo-claw puts at most ${limit.toLocaleString()} characters of SPACE.md into each prompt`}
+    >
+      {n.toLocaleString()} / {limit.toLocaleString()} chars{over ? ` · ${(n - limit).toLocaleString()} over: the end gets cut off` : near ? " · close to the limit" : ""}
+    </span>
+  )
+}
+
+/** Mission control and on/off. MC is written to the space index; on/off goes through neo-claw (/space init, /space off). */
+function SpaceConfig({ space, onSaved }: { space: SpaceView; onSaved: () => void }) {
+  const [mc, setMc] = useState(space.missionControlChannelId ?? "")
+  const [busy, setBusy] = useState<string | null>(null)
+  const [msg, setMsg] = useState<{ tone: "ok" | "err"; text: string } | null>(null)
+  useEffect(() => setMc(space.missionControlChannelId ?? ""), [space.missionControlChannelId])
+  const run = async (label: string, fn: () => Promise<unknown>, ok: string) => {
+    setBusy(label)
+    setMsg(null)
+    try {
+      await fn()
+      setMsg({ tone: "ok", text: ok })
+      invalidateNc(`/space/${space.id}`, "/tree", "/library", "/home")
+      onSaved()
+    } catch (e) {
+      setMsg({ tone: "err", text: e instanceof Error ? e.message : String(e) })
+    } finally {
+      setBusy(null)
+    }
+  }
+  const saveMc = () => run("mc", () => ncPost(`/space/${space.id}/config`, { missionControlChannelId: mc }), "Mission control changed.")
+  const turnOn = () => {
+    if (!window.confirm(`Turn ${space.name} into a space? Its channels will share SPACE.md, the space's skills and MCP servers.${space.missionControlChannelId ? "" : " neo-claw creates #space-chat as mission control if there isn't one."}`)) return
+    void run("on", () => ncPost(`/space/${space.id}/action`, { action: "init", mode: "create" }), "Space turned on.")
+  }
+  const turnOff = () => {
+    if (!window.confirm(`Turn ${space.name} off? Channels stop getting SPACE.md and the space's skills. Files are kept, and you can turn it back on.`)) return
+    void run("off", () => ncPost(`/space/${space.id}/action`, { action: "off" }), "Space turned off.")
+  }
+  const on = space.isSpace && space.enabled
+  return (
+    <Section title="Space">
+      {msg ? <div className={cn("mb-2 rounded-lg px-3 py-2 text-xs", msg.tone === "ok" ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400" : "bg-red-500/10 text-red-600 dark:text-red-400")}>{msg.text}</div> : null}
+      <Panel>
+        <div className="flex flex-wrap items-center gap-3 border-b border-border px-3 py-2.5">
+          <div className="min-w-[10rem] flex-1">
+            <div className="text-[13.5px] font-medium">Status</div>
+            <div className="text-[11.5px] text-muted-foreground">{on ? "On: every channel here gets SPACE.md, space skills and MCP servers." : space.isSpace ? "Off: files are kept, nothing is given to the channels." : "Not a space yet."}</div>
+          </div>
+          {on ? (
+            <button type="button" disabled={busy != null || !space.apiReachable} onClick={turnOff} className="h-8 rounded-lg border border-border px-3 text-[12.5px] hover:bg-muted disabled:opacity-50">
+              {busy === "off" ? "Turning off…" : "Turn off"}
+            </button>
+          ) : (
+            <button type="button" disabled={busy != null || !space.apiReachable} onClick={turnOn} className="h-8 rounded-lg bg-foreground px-3 text-[12.5px] text-background disabled:opacity-50">
+              {busy === "on" ? "Turning on…" : "Turn on"}
+            </button>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-3 px-3 py-2.5">
+          <div className="min-w-[10rem] flex-1">
+            <div className="text-[13.5px] font-medium">Mission control</div>
+            <div className="text-[11.5px] text-muted-foreground">The chat that keeps SPACE.md and answers for the whole space.</div>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <select value={mc} disabled={!space.isSpace || busy != null} onChange={(e) => setMc(e.target.value)} className="h-8 max-w-[14rem] rounded-lg border border-border bg-card px-2 text-[12.5px] outline-none disabled:opacity-50" aria-label="mission control channel">
+              {!mc ? <option value="">none</option> : null}
+              {space.members.map((m) => (
+                <option key={m.id} value={m.id}>
+                  #{m.name}
+                </option>
+              ))}
+            </select>
+            <button type="button" disabled={!space.isSpace || busy != null || !mc || mc === (space.missionControlChannelId ?? "")} onClick={() => void saveMc()} className="h-8 rounded-lg bg-foreground px-2.5 text-[12px] text-background disabled:opacity-40">
+              {busy === "mc" ? "Saving…" : "Set"}
+            </button>
+          </div>
+        </div>
+      </Panel>
+      {!space.apiReachable ? <p className="mt-2 px-1 text-[12px] text-muted-foreground">Turning the space on or off needs neo-claw's web API, which isn't reachable right now.</p> : null}
+      <p className="mt-2 px-1 text-[11.5px] text-muted-foreground">The space's name is its Discord category name: rename the category in Discord.</p>
+    </Section>
+  )
+}
+
+function SpaceMcp({ space }: { space: SpaceView }) {
+  return (
+    <Section title="MCP servers (mcp.json, read-only)">
+      {space.mcp.length === 0 ? (
+        <Empty>No space MCP servers. Servers in the space's mcp.json are given to every channel in it.</Empty>
+      ) : (
+        <div className="space-y-2">
+          {space.mcp.map((m) => (
+            <div key={m.name} className="rounded-xl border border-border bg-card px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <Plug className="size-4 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 flex-1 truncate text-[14px] font-medium">{m.name}</span>
+                <Pill>{m.type}</Pill>
+              </div>
+              <div className="mt-1 overflow-x-auto whitespace-nowrap font-mono text-[11.5px] text-muted-foreground">{[m.command, ...m.args].filter(Boolean).join(" ")}</div>
+              {Object.keys(m.env).length || Object.keys(m.headers).length ? (
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {Object.entries(m.env).map(([k, v]) => (
+                    <Pill key={`e${k}`} className="font-mono">
+                      {k}={v}
+                    </Pill>
+                  ))}
+                  {Object.entries(m.headers).map(([k, v]) => (
+                    <Pill key={`h${k}`} className="font-mono">
+                      {k}: {v}
+                    </Pill>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      )}
     </Section>
   )
 }
