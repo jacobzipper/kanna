@@ -544,7 +544,8 @@ async function infra(ctx: AppContext) {
   const name = (id: string | null) => (id ? findChannel(tree, id)?.name ?? null : null)
   return {
     ops,
-    nodes,
+    // Always send a list: hosts without a node CLI (or with a failing one) used to blank the page.
+    nodes: { configured: nodes.configured, nodes: "nodes" in nodes ? nodes.nodes : [], error: "error" in nodes ? nodes.error : null },
     wakes: jobs.wakes.slice(0, 60).map((w) => ({ ...w, logFile: w.logFile ? path.basename(w.logFile) : null, channelName: name(w.channelId) })),
     terminals: jobs.terminals.map((t) => ({ ...t, channelName: name(t.channelId) })),
     links: ctx.bridge.overviewLinks(),
