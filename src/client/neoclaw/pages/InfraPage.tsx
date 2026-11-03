@@ -23,7 +23,7 @@ interface InfraView {
     queue: { id: string; note: string; queued_at: string; queuedAtMs: number | null; prs: number[] }[]
     deployLog: string | null
   }
-  nodes: { configured: boolean; nodes: NodeInfo[] }
+  nodes: { configured: boolean; nodes: NodeInfo[]; error?: string | null }
   wakes: { id: string; kind: string; status: string; host: string | null; channelId: string | null; channelName: string | null; note: string | null; jobName: string | null; createdAt: string; fireAt: string | null; firedAt: string | null }[]
   terminals: { terminalId: string; channelId: string; channelName: string | null; name: string; command: string; status: string; mode: string; restartPolicy: string; updatedAt: string }[]
   links: { label: string; url: string }[]
@@ -62,7 +62,7 @@ export function InfraPage() {
           onChange={setTab}
           tabs={[
             { id: "ops", label: "Server" },
-            { id: "nodes", label: "Nodes", count: data?.nodes.nodes.length },
+            { id: "nodes", label: "Nodes", count: data?.nodes.nodes?.length },
             { id: "jobs", label: "Jobs", count: data ? waiting.length || null : null },
             { id: "terminals", label: "Terminals", count: data?.terminals.length },
           ]}
@@ -137,7 +137,9 @@ export function InfraPage() {
             {tab === "nodes" ? (
               !data.nodes.configured ? (
                 <Empty>No compute nodes on this host.</Empty>
-              ) : data.nodes.nodes.length === 0 ? (
+              ) : data.nodes.error ? (
+                <Notice tone="warn">Couldn't list compute nodes: {data.nodes.error}</Notice>
+              ) : !data.nodes.nodes?.length ? (
                 <Empty>No nodes enrolled.</Empty>
               ) : (
                 <div className="grid gap-3 md:grid-cols-2">
